@@ -13586,7 +13586,7 @@ update:
             */
             Select->set_lock_for_tables($3);
           }
-          opt_where_clause opt_order_clause delete_limit_clause
+          opt_where_clause opt_order_clause delete_limit_clause opt_select_expressions
           {
             if ($10)
               Select->order_list= *($10);

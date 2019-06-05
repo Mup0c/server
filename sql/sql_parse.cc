@@ -4616,9 +4616,13 @@ end_with_restore_list:
   }
   case SQLCOM_UPDATE:
   {
+
+
     WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_UPDATE_DELETE);
     ha_rows found= 0, updated= 0;
-    DBUG_ASSERT(first_table == all_tables && first_table != 0);
+      select_result *sel_result= NULL;
+
+      DBUG_ASSERT(first_table == all_tables && first_table != 0);
     WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_UPDATE_DELETE);
 
     if (update_precheck(thd, all_tables))
@@ -4636,15 +4640,37 @@ end_with_restore_list:
     DBUG_ASSERT(select_lex->offset_limit == 0);
     unit->set_limit(select_lex);
     MYSQL_UPDATE_START(thd->query());
+
+      if (!select_lex->item_list.is_empty())
+      {
+          /* This is DELETE ... RETURNING.  It will return output to the client */
+          if (thd->lex->analyze_stmt)
+          {
+              /*
+                Actually, it is ANALYZE .. DELETE .. RETURNING. We need to produce
+                output and then discard it.
+              */
+              sel_result= new (thd->mem_root) select_send_analyze(thd);
+              thd->protocol= new Protocol_discard(thd);
+          }
+          else
+          {
+              if (!lex->result && !(sel_result= new (thd->mem_root) select_send(thd)))
+                  goto error;
+
+          }
+      }
+
     res= up_result= mysql_update(thd, all_tables,
-                                  select_lex->item_list,
-                                  lex->value_list,
-                                  select_lex->where,
-                                  select_lex->order_list.elements,
-                                  select_lex->order_list.first,
-                                  unit->select_limit_cnt,
-                                  lex->duplicates, lex->ignore,
-                                  &found, &updated);
+                                 select_lex->item_list,
+                                 lex->value_list,
+                                 select_lex->where,
+                                 select_lex->order_list.elements,
+                                 select_lex->order_list.first,
+                                 unit->select_limit_cnt,
+                                 lex->duplicates, lex->ignore,
+                                 &found, &updated,
+                                 lex->result ? lex->result : sel_result);
     MYSQL_UPDATE_DONE(res, found, updated);
     /* mysql_update return 2 if we need to switch to multi-update */
     if (up_result != 2)
@@ -9564,8 +9590,9 @@ bool update_precheck(THD *thd, TABLE_LIST *tables)
   if (thd->lex->first_select_lex()->item_list.elements !=
       thd->lex->value_list.elements)
   {
-    my_message(ER_WRONG_VALUE_COUNT, ER_THD(thd, ER_WRONG_VALUE_COUNT), MYF(0));
-    DBUG_RETURN(TRUE);
+      thd->lex->first_select_lex()->item_list.pop();
+    //my_message(ER_WRONG_VALUE_COUNT, ER_THD(thd, ER_WRONG_VALUE_COUNT), MYF(0));
+    //DBUG_RETURN(TRUE);
   }
   DBUG_RETURN(check_one_table_access(thd, UPDATE_ACL, tables));
 }

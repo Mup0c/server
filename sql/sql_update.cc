@@ -330,15 +330,9 @@ int cut_fields_for_portion_of_time(THD *thd, TABLE *table,
     1  - error
 */
 
-int mysql_update(THD *thd,
-                 TABLE_LIST *table_list,
-                 List<Item> &fields,
-		 List<Item> &values,
-                 COND *conds,
-                 uint order_num, ORDER *order,
-		 ha_rows limit,
-		 enum enum_duplicates handle_duplicates, bool ignore,
-                 ha_rows *found_return, ha_rows *updated_return)
+int mysql_update(THD *thd, TABLE_LIST *table_list, List<Item> &fields, List<Item> &values, COND *conds, uint order_num,
+                 ORDER *order, ha_rows limit, enum enum_duplicates handle_duplicates, bool ignore,
+                 ha_rows *found_return, ha_rows *updated_return, select_result *result)
 {
   bool		using_limit= limit != HA_POS_ERROR;
   bool          safe_update= thd->variables.option_bits & OPTION_SAFE_UPDATES;
@@ -365,6 +359,7 @@ int mysql_update(THD *thd,
   List<Item> all_fields;
   killed_state killed_status= NOT_KILLED;
   bool has_triggers, binlog_is_row, do_direct_update= FALSE;
+  bool with_select= !select_lex->item_list.is_empty();
   Update_plan query_plan(thd->mem_root);
   Explain_update *explain;
   TABLE_LIST *update_source_table;
@@ -432,6 +427,9 @@ int mysql_update(THD *thd,
 #endif
   if (mysql_prepare_update(thd, table_list, &conds, order_num, order))
     DBUG_RETURN(1);
+
+    if (with_select)
+        (void) result->prepare(select_lex->item_list, NULL);
 
   old_covering_keys= table->covering_keys;		// Keys used in WHERE
   /* Check the fields we are going to modify */
@@ -869,7 +867,7 @@ int mysql_update(THD *thd,
   }
 
 update_begin:
-  if (ignore)
+    if (ignore)
     table->file->extra(HA_EXTRA_IGNORE_DUP_KEY);
   
   if (select && select->quick && select->quick->reset())
@@ -928,8 +926,11 @@ update_begin:
     {
       continue;
     }
+    if (with_select) {
+        result->send_data(select_lex->item_list);
+    }
 
-    explain->tracker.on_record_read();
+      explain->tracker.on_record_read();
     thd->inc_examined_row_count(1);
     if (!select || select->skip_record(thd) > 0)
     {
@@ -1262,11 +1263,15 @@ update_end:
                   ER_THD(thd, ER_UPDATE_INFO_WITH_SYSTEM_VERSIONING),
                   (ulong) found, (ulong) updated, (ulong) rows_inserted,
                   (ulong) thd->get_stmt_da()->current_statement_warn_count());
-    my_ok(thd, (thd->client_capabilities & CLIENT_FOUND_ROWS) ? found : updated,
-          id, buff);
+      result->send_eof();
+
+      /*my_ok(thd, (thd->client_capabilities & CLIENT_FOUND_ROWS) ? found : updated,
+            id, buff);*/
     DBUG_PRINT("info",("%ld records updated", (long) updated));
   }
-  thd->count_cuted_fields= CHECK_FIELD_IGNORE;		/* calc cuted fields */
+
+
+    thd->count_cuted_fields= CHECK_FIELD_IGNORE;		/* calc cuted fields */
   thd->abort_on_warning= 0;
   if (thd->lex->current_select->first_cond_optimization)
   {
