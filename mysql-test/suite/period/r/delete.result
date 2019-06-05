@@ -1,4 +1,4 @@
-create or replace table t (id int, s date, e date, period for apptime(s,e));
+create table t (id int, s date, e date, period for apptime(s,e));
 insert into t values(1, '1999-01-01', '2018-12-12');
 insert into t values(1, '1999-01-01', '2017-01-01');
 insert into t values(1, '2017-01-01', '2019-01-01');
@@ -291,7 +291,7 @@ ERROR 42S02: 'v' is a view
 # View can't be used
 create or replace view v as select t.* from t, t as t1;
 delete from v for portion of p from '2000-01-01' to '2018-01-01';
-ERROR 42S02: 'v' is a view
+ERROR HY000: Can not delete from join view 'test.v'
 # auto_increment field overflow
 create or replace table t (id tinyint auto_increment primary key,
 s date, e date, period for apptime(s,e));
@@ -353,4 +353,6 @@ id	s	e	datediff(e, s)
 1	1999-01-01	1999-01-03	2
 1	2018-12-10	2018-12-12	2
 2	1999-01-01	1999-01-03	2
-create or replace database test;
+drop table t,t2,t3,log_tbl;
+drop view v;
+drop procedure log;

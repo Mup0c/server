@@ -12,7 +12,7 @@
 # 
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1335 USA
 
 ADD_DEFINITIONS(-DMYSQL_SERVER -DEMBEDDED_LIBRARY
  ${SSL_DEFINES})
@@ -119,13 +119,13 @@ SET(SQL_EMBEDDED_SOURCES emb_qcache.cc libmysqld.c lib_sql.cc
            ../sql/sql_sequence.cc ../sql/sql_sequence.h
            ../sql/ha_sequence.cc ../sql/ha_sequence.h
            ../sql/temporary_tables.cc
-           ../sql/session_tracker.cc
            ../sql/proxy_protocol.cc ../sql/backup.cc
            ../sql/sql_tvc.cc ../sql/sql_tvc.h
            ../sql/opt_split.cc
            ../sql/rowid_filter.cc ../sql/rowid_filter.h
            ../sql/item_vers.cc
            ../sql/opt_trace.cc
+           ../sql/xa.cc
            ${GEN_SOURCES}
            ${MYSYS_LIBWRAP_SOURCE}
 )

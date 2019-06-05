@@ -12,7 +12,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335  USA */
 
 
 /*
@@ -273,6 +273,14 @@ static void prepare_record_for_error_message(int error, TABLE *table)
   bitmap_union(table->read_set, &unique_map);
   /* Tell the engine about the new set. */
   table->file->column_bitmaps_signal();
+
+  if ((error= table->file->ha_index_or_rnd_end()) ||
+      (error= table->file->ha_rnd_init(0)))
+  {
+    table->file->print_error(error, MYF(0));
+    DBUG_VOID_RETURN;
+  }
+
   /* Read record that is identified by table->file->ref. */
   (void) table->file->ha_rnd_pos(table->record[1], table->file->ref);
   /* Copy the newly read columns into the new record. */
@@ -321,7 +329,6 @@ int cut_fields_for_portion_of_time(THD *thd, TABLE *table,
     order_num		number of elemen in ORDER BY clause
     order		ORDER BY clause list
     limit		limit clause
-    handle_duplicates	how to handle duplicates
 
   RETURN
     0  - OK
@@ -336,8 +343,8 @@ int mysql_update(THD *thd,
 		 List<Item> &values,
                  COND *conds,
                  uint order_num, ORDER *order,
-		 ha_rows limit,
-		 enum enum_duplicates handle_duplicates, bool ignore,
+                 ha_rows limit,
+                 bool ignore,
                  ha_rows *found_return, ha_rows *updated_return)
 {
   bool		using_limit= limit != HA_POS_ERROR;
@@ -404,6 +411,8 @@ int mysql_update(THD *thd,
   if (lock_tables(thd, table_list, table_count, 0))
     DBUG_RETURN(1);
 
+  (void) read_statistics_for_tables_if_needed(thd, table_list);
+
   THD_STAGE_INFO(thd, stage_init_update);
   if (table_list->handle_derived(thd->lex, DT_MERGE_FOR_INSERT))
     DBUG_RETURN(1);
@@ -432,6 +441,16 @@ int mysql_update(THD *thd,
 #endif
   if (mysql_prepare_update(thd, table_list, &conds, order_num, order))
     DBUG_RETURN(1);
+
+  if (table_list->has_period())
+  {
+    if (!table_list->period_conditions.start.item->const_item()
+        || !table_list->period_conditions.end.item->const_item())
+    {
+      my_error(ER_NOT_CONSTANT_EXPRESSION, MYF(0), "FOR PORTION OF");
+      DBUG_RETURN(true);
+    }
+  }
 
   old_covering_keys= table->covering_keys;		// Keys used in WHERE
   /* Check the fields we are going to modify */
@@ -558,9 +577,14 @@ int mysql_update(THD *thd,
     goto err;
 
   if (table_list->has_period())
+  {
     table->use_all_columns();
+    table->rpl_write_set= table->write_set;
+  }
   else
+  {
     table->mark_columns_needed_for_update();
+  }
 
   table->update_const_key_parts(conds);
   order= simple_remove_const(order, conds);
@@ -1029,6 +1053,7 @@ update_begin:
             if (table->versioned(VERS_TIMESTAMP))
             {
               store_record(table, record[2]);
+              table->mark_columns_per_binlog_row_image();
               error= vers_insert_history_row(table);
               restore_record(table, record[2]);
             }
@@ -1366,15 +1391,6 @@ bool mysql_prepare_update(THD *thd, TABLE_LIST *table_list,
       setup_ftfuncs(select_lex))
     DBUG_RETURN(TRUE);
 
-  if (table_list->has_period())
-  {
-    if (!table_list->period_conditions.start.item->const_item()
-        || !table_list->period_conditions.end.item->const_item())
-    {
-      my_error(ER_NOT_CONSTANT_EXPRESSION, MYF(0), "FOR PORTION OF");
-      DBUG_RETURN(true);
-    }
-  }
 
   select_lex->fix_prepare_information(thd, conds, &fake_conds);
   DBUG_RETURN(FALSE);
@@ -1626,6 +1642,9 @@ int mysql_multi_update_prepare(THD *thd)
   List<Item> *fields= &lex->first_select_lex()->item_list;
   table_map tables_for_update;
   bool update_view= 0;
+  DML_prelocking_strategy prelocking_strategy;
+  bool has_prelocking_list= thd->lex->requires_prelocking();
+
   /*
     if this multi-update was converted from usual update, here is table
     counter else junk will be assigned here, but then replaced with real
@@ -1646,10 +1665,10 @@ int mysql_multi_update_prepare(THD *thd)
     keep prepare of multi-UPDATE compatible with concurrent LOCK TABLES WRITE
     and global read lock.
   */
-  if ((original_multiupdate &&
-       open_tables(thd, &table_list, &table_count,
-                   (thd->stmt_arena->is_stmt_prepare() ?
-                    MYSQL_OPEN_FORCE_SHARED_MDL : 0))) ||
+  if ((original_multiupdate && open_tables(thd, &table_list, &table_count,
+                                           thd->stmt_arena->is_stmt_prepare()
+                                           ? MYSQL_OPEN_FORCE_SHARED_MDL : 0,
+                                           &prelocking_strategy)) ||
       mysql_handle_derived(lex, DT_INIT))
     DBUG_RETURN(TRUE);
   /*
@@ -1664,6 +1683,17 @@ int mysql_multi_update_prepare(THD *thd)
 
   if (mysql_handle_derived(lex, DT_PREPARE))
     DBUG_RETURN(TRUE);
+
+  if (table_list->has_period())
+  {
+    /*
+      Multi-table update is not supported on syntax lexel. However it's possible
+      to get here through PREPARE with update of multi-table view.
+     */
+    DBUG_ASSERT(table_list->is_view_or_derived());
+    my_error(ER_IT_IS_A_VIEW, MYF(0), table_list->table_name.str);
+    DBUG_RETURN(TRUE);
+  }
 
   if (setup_tables_and_check_access(thd,
                                     &lex->first_select_lex()->context,
@@ -1700,6 +1730,9 @@ int mysql_multi_update_prepare(THD *thd)
                         tables_for_update))
     DBUG_RETURN(true);
 
+  TABLE_LIST **new_tables= lex->query_tables_last;
+  DBUG_ASSERT(*new_tables== NULL);
+
   /*
     Setup timestamp handling and locking mode
   */
@@ -1727,6 +1760,11 @@ int mysql_multi_update_prepare(THD *thd)
         If table will be updated we should not downgrade lock for it and
         leave it as is.
       */
+      tl->updating= 1;
+      if (tl->belong_to_view)
+        tl->belong_to_view->updating= 1;
+      if (extend_table_list(thd, tl, &prelocking_strategy, has_prelocking_list))
+        DBUG_RETURN(TRUE);
     }
     else
     {
@@ -1749,7 +1787,6 @@ int mysql_multi_update_prepare(THD *thd)
         tl->lock_type= lock_type;
       else
         tl->set_lock_type(thd, lock_type);
-      tl->updating= 0;
     }
   }
 
@@ -1758,6 +1795,20 @@ int mysql_multi_update_prepare(THD *thd)
     Note that unlike in the above loop we need to iterate here not only
     through all leaf tables but also through all view hierarchy.
   */
+
+  uint addon_table_count= 0;
+  if (*new_tables)
+  {
+    Sroutine_hash_entry **new_routines= thd->lex->sroutines_list.next;
+    DBUG_ASSERT(*new_routines == NULL);
+    if (open_tables(thd, thd->lex->create_info, new_tables,
+                    &addon_table_count, new_routines,
+                    thd->stmt_arena->is_stmt_prepare()
+                    ? MYSQL_OPEN_FORCE_SHARED_MDL : 0,
+                    &prelocking_strategy))
+      DBUG_RETURN(TRUE);
+  }
+
   for (tl= table_list; tl; tl= tl->next_local)
   {
     bool not_used= false;
@@ -1786,10 +1837,11 @@ int mysql_multi_update_prepare(THD *thd)
 
   /* now lock and fill tables */
   if (!thd->stmt_arena->is_stmt_prepare() &&
-      lock_tables(thd, table_list, table_count, 0))
+      lock_tables(thd, table_list, table_count + addon_table_count, 0))
   {
     DBUG_RETURN(TRUE);
   }
+  (void) read_statistics_for_tables_if_needed(thd, table_list);
   /* @todo: downgrade the metadata locks here. */
 
   /*

@@ -1,4 +1,5 @@
-/* Copyright (C) 2008-2018 Kentoku Shiba
+/* Copyright (C) 2008-2019 Kentoku Shiba
+   Copyright (C) 2019 MariaDB corp
 
   This program is free software); you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -11,7 +12,7 @@
 
   You should have received a copy of the GNU General Public License
   along with this program); if not, write to the Free Software
-  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA */
 
 my_bool spider_param_support_xa();
 my_bool spider_param_connect_mutex();
@@ -421,3 +422,9 @@ uint spider_param_table_sts_thread_count();
 uint spider_param_table_crd_thread_count();
 #endif
 int spider_param_slave_trx_isolation();
+int spider_param_remote_wait_timeout(
+  THD *thd
+);
+int spider_param_wait_timeout(
+  THD *thd
+);

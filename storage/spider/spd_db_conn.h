@@ -11,7 +11,7 @@
 
   You should have received a copy of the GNU General Public License
   along with this program; if not, write to the Free Software
-  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA */
 
 #define SPIDER_DB_WRAPPER_STR "mysql"
 #define SPIDER_DB_WRAPPER_LEN (sizeof(SPIDER_DB_WRAPPER_STR) - 1)
@@ -470,6 +470,11 @@ int spider_db_append_key_where(
   const key_range *start_key,
   const key_range *end_key,
   ha_spider *spider
+);
+
+int spider_db_append_charset_name_before_string(
+  spider_string *str,
+  CHARSET_INFO *cs
 );
 
 #ifdef HANDLER_HAS_DIRECT_AGGREGATE

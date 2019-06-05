@@ -11,7 +11,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02111-1301 USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA */
 
 #ifndef JSON_WRITER_INCLUDED
 #define JSON_WRITER_INCLUDED
@@ -259,7 +259,7 @@ public:
   void add_str(const char* val, size_t length)
   {
     if (writer)
-      writer->add_str(val);
+      writer->add_str(val, length);
   }
   void add_str(const String &str)
   {

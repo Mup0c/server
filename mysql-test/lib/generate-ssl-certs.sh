@@ -34,7 +34,7 @@ openssl ca -keyfile cakey.pem -days 7300 -batch -cert cacert.pem -policy policy_
 
 # with SubjectAltName, only for OpenSSL 1.0.2+
 cat > demoCA/sanext.conf <<EOF
-subjectAltName=DNS:localhost
+subjectAltName=IP:127.0.0.1, DNS:localhost
 EOF
 openssl req -newkey rsa:2048 -keyout serversan-key.pem -out demoCA/serversan-req.pem -days 7300 -nodes -subj '/CN=server/C=FI/ST=Helsinki/L=Helsinki/O=MariaDB'
 openssl ca -keyfile cakey.pem -extfile demoCA/sanext.conf -days 7300 -batch -cert cacert.pem -policy policy_anything -out serversan-cert.pem -in demoCA/serversan-req.pem
@@ -43,6 +43,9 @@ openssl ca -keyfile cakey.pem -extfile demoCA/sanext.conf -days 7300 -batch -cer
 openssl req -newkey rsa:2048 -keyout client-key.pem -out demoCA/client-req.pem -days 7300 -nodes -subj '/CN=client/C=FI/ST=Helsinki/L=Helsinki/O=MariaDB'
 openssl rsa -in client-key.pem -out client-key.pem
 openssl ca -keyfile cakey.pem -days 7300 -batch -cert cacert.pem -policy policy_anything -out client-cert.pem -in demoCA/client-req.pem
+
+# generate combined client cert and key file
+cat client-cert.pem client-key.pem > client-certkey.pem
 
 # generate crls
 openssl ca -revoke server-cert.pem -keyfile cakey.pem -batch -cert cacert.pem

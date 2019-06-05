@@ -1,5 +1,5 @@
 /*
-  Copyright (c) 2016 MariaDB Corporation
+  Copyright (c) 2016, 2019, MariaDB Corporation.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -49,23 +49,18 @@ bool THD::has_thd_temporary_tables()
 /**
   Create a temporary table, open it and return the TABLE handle.
 
-  @param hton [IN]                    Handlerton
   @param frm  [IN]                    Binary frm image
   @param path [IN]                    File path (without extension)
   @param db   [IN]                    Schema name
   @param table_name [IN]              Table name
-  @param open_in_engine [IN]          Whether open table in SE
-
 
   @return Success                     A pointer to table object
           Failure                     NULL
 */
-TABLE *THD::create_and_open_tmp_table(handlerton *hton,
-                                      LEX_CUSTRING *frm,
+TABLE *THD::create_and_open_tmp_table(LEX_CUSTRING *frm,
                                       const char *path,
                                       const char *db,
                                       const char *table_name,
-                                      bool open_in_engine,
                                       bool open_internal_tables)
 {
   DBUG_ENTER("THD::create_and_open_tmp_table");
@@ -73,10 +68,10 @@ TABLE *THD::create_and_open_tmp_table(handlerton *hton,
   TMP_TABLE_SHARE *share;
   TABLE *table= NULL;
 
-  if ((share= create_temporary_table(hton, frm, path, db, table_name)))
+  if ((share= create_temporary_table(frm, path, db, table_name)))
   {
     open_options|= HA_OPEN_FOR_CREATE;
-    table= open_temporary_table(share, table_name, open_in_engine);
+    table= open_temporary_table(share, table_name);
     open_options&= ~HA_OPEN_FOR_CREATE;
 
     /*
@@ -96,7 +91,7 @@ TABLE *THD::create_and_open_tmp_table(handlerton *hton,
 
     /* Open any related tables */
     if (open_internal_tables && table->internal_tables &&
-        open_and_lock_internal_tables(table, open_in_engine))
+        open_and_lock_internal_tables(table, true))
     {
       drop_temporary_table(table, NULL, false);
       DBUG_RETURN(0);
@@ -381,7 +376,20 @@ bool THD::open_temporary_table(TABLE_LIST *tl)
   */
   if (!table && (share= find_tmp_table_share(tl)))
   {
-    table= open_temporary_table(share, tl->get_table_name(), true);
+    table= open_temporary_table(share, tl->get_table_name());
+    /*
+       Temporary tables are not safe for parallel replication. They were
+       designed to be visible to one thread only, so have no table locking.
+       Thus there is no protection against two conflicting transactions
+       committing in parallel and things like that.
+
+       So for now, anything that uses temporary tables will be serialised
+       with anything before it, when using parallel replication.
+    */
+    if (table && rgi_slave &&
+        rgi_slave->is_parallel_exec &&
+        wait_for_prior_commit())
+      DBUG_RETURN(true);
   }
 
   if (!table)
@@ -905,7 +913,6 @@ uint THD::create_tmp_table_def_key(char *key, const char *db,
 /**
   Create a temporary table.
 
-  @param hton [IN]                    Handlerton
   @param frm  [IN]                    Binary frm image
   @param path [IN]                    File path (without extension)
   @param db   [IN]                    Schema name
@@ -914,8 +921,7 @@ uint THD::create_tmp_table_def_key(char *key, const char *db,
   @return Success                     A pointer to table share object
           Failure                     NULL
 */
-TMP_TABLE_SHARE *THD::create_temporary_table(handlerton *hton,
-                                             LEX_CUSTRING *frm,
+TMP_TABLE_SHARE *THD::create_temporary_table(LEX_CUSTRING *frm,
                                              const char *path,
                                              const char *db,
                                              const char *table_name)
@@ -952,8 +958,6 @@ TMP_TABLE_SHARE *THD::create_temporary_table(handlerton *hton,
 
   init_tmp_table_share(this, share, saved_key_cache, key_length,
                        strend(saved_key_cache) + 1, tmp_path);
-
-  share->db_plugin= ha_lock_engine(this, hton);
 
   /*
     Prefer using frm image over file. The image might not be available in
@@ -1081,14 +1085,12 @@ TABLE *THD::find_temporary_table(const char *key, uint key_length,
 
   @param share [IN]                   Table share
   @param alias [IN]                   Table alias
-  @param open_in_engine [IN]          Whether open table in SE
 
   @return Success                     A pointer to table object
           Failure                     NULL
 */
 TABLE *THD::open_temporary_table(TMP_TABLE_SHARE *share,
-                                 const char *alias_arg,
-                                 bool open_in_engine)
+                                 const char *alias_arg)
 {
   TABLE *table;
   LEX_CSTRING alias= {alias_arg, strlen(alias_arg) };
@@ -1101,11 +1103,11 @@ TABLE *THD::open_temporary_table(TMP_TABLE_SHARE *share,
   }
 
   if (open_table_from_share(this, share, &alias,
-                            open_in_engine ? (uint)HA_OPEN_KEYFILE : 0,
+                            (uint) HA_OPEN_KEYFILE,
                             EXTRA_RECORD,
                             (ha_open_options |
                              (open_options & HA_OPEN_FOR_CREATE)),
-                            table, open_in_engine ? false : true))
+                            table, false))
   {
     my_free(table);
     DBUG_RETURN(NULL);

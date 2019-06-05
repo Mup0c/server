@@ -11,7 +11,7 @@
 
   You should have received a copy of the GNU General Public License
   along with this program; if not, write to the Free Software
-  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA */
 
 #define MYSQL_SERVER 1
 #include <my_global.h>
@@ -1839,6 +1839,23 @@ int spider_db_handlersocket::set_sql_log_off(
   DBUG_RETURN(0);
 }
 
+bool spider_db_handlersocket::set_wait_timeout_in_bulk_sql()
+{
+  DBUG_ENTER("spider_db_handlersocket::set_wait_timeout_in_bulk_sql");
+  DBUG_PRINT("info",("spider this=%p", this));
+  DBUG_RETURN(FALSE);
+}
+
+int spider_db_handlersocket::set_wait_timeout(
+  int wait_timeout,
+  int *need_mon
+) {
+  DBUG_ENTER("spider_db_handlersocket::set_wait_timeout");
+  DBUG_PRINT("info",("spider this=%p", this));
+  /* nothing to do */
+  DBUG_RETURN(0);
+}
+
 bool spider_db_handlersocket::set_time_zone_in_bulk_sql()
 {
   DBUG_ENTER("spider_db_handlersocket::set_time_zone_in_bulk_sql");
@@ -2670,6 +2687,16 @@ int spider_db_handlersocket_util::append_sql_log_off(
   bool sql_log_off
 ) {
   DBUG_ENTER("spider_db_handlersocket_util::append_sql_log_off");
+  DBUG_PRINT("info",("spider this=%p", this));
+  /* nothing to do */
+  DBUG_RETURN(0);
+}
+
+int spider_db_handlersocket_util::append_wait_timeout(
+  spider_string *str,
+  int wait_timeout
+) {
+  DBUG_ENTER("spider_db_handlersocket_util::append_wait_timeout");
   DBUG_PRINT("info",("spider this=%p", this));
   /* nothing to do */
   DBUG_RETURN(0);

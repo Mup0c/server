@@ -12,7 +12,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software Foundation,
-   51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA */
+   51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA */
 
 
 /**
@@ -253,16 +253,11 @@ static void track_table_access(THD *thd, TABLE **tables, size_t count)
 {
   if (thd->variables.session_track_transaction_info > TX_TRACK_NONE)
   {
-    Transaction_state_tracker *tst= (Transaction_state_tracker *)
-      thd->session_tracker.get_tracker(TRANSACTION_INFO_TRACKER);
-
     while (count--)
     {
-      TABLE *t= tables[count];
-
-      if (t)
-        tst->add_trx_state(thd,  t->reginfo.lock_type,
-                           t->file->has_transaction_manager());
+      if (TABLE *t= tables[count])
+        thd->session_tracker.transaction_info.add_trx_state(thd,
+          t->reginfo.lock_type, t->file->has_transaction_manager());
     }
   }
 }
@@ -1034,7 +1029,12 @@ bool Global_read_lock::lock_global_read_lock(THD *thd)
       DBUG_RETURN(1);
     }
 
+    /*
+      Release HANDLER OPEN by the current THD as they may cause deadlocks
+      if another thread is trying to simultaneous drop the table
+    */
     mysql_ha_cleanup_no_free(thd);
+    DEBUG_SYNC(thd, "ftwrl_before_lock");
 
     DBUG_ASSERT(! thd->mdl_context.is_lock_owner(MDL_key::BACKUP, "", "",
                                                  MDL_BACKUP_FTWRL1));

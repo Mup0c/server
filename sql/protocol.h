@@ -14,7 +14,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335  USA */
 
 #ifdef USE_PRAGMA_INTERFACE
 #pragma interface			/* gcc class implementation */
@@ -22,6 +22,7 @@
 
 #include "sql_error.h"
 #include "my_decimal.h"                         /* my_decimal */
+#include "sql_type.h"
 
 class i_string;
 class Field;
@@ -40,7 +41,12 @@ protected:
   String *convert;
   uint field_pos;
 #ifndef DBUG_OFF
-  enum enum_field_types *field_types;
+  const Type_handler **field_handlers;
+  bool valid_handler(uint pos, protocol_send_type_t type) const
+  {
+    return field_handlers == 0 ||
+           field_handlers[field_pos]->protocol_send_type() == type;
+  }
 #endif
   uint field_count;
 #ifndef EMBEDDED_LIBRARY

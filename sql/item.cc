@@ -1,6 +1,6 @@
 /*
    Copyright (c) 2000, 2018, Oracle and/or its affiliates.
-   Copyright (c) 2010, 2018, MariaDB Corporation
+   Copyright (c) 2010, 2019, MariaDB Corporation
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -13,7 +13,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335  USA */
 
 
 #ifdef USE_PRAGMA_IMPLEMENTATION
@@ -261,6 +261,49 @@ longlong Item::val_int_unsigned_typecast_from_str()
   longlong value= val_int_from_str(&error);
   if (unlikely(!null_value && error < 0))
     push_note_converted_to_positive_complement(current_thd);
+  return value;
+}
+
+
+longlong Item::val_int_signed_typecast_from_real()
+{
+  double nr= val_real();
+  if (null_value)
+    return 0;
+  Converter_double_to_longlong conv(nr, false);
+  if (conv.error())
+  {
+    THD *thd= current_thd;
+    push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE,
+                        ER_DATA_OVERFLOW, ER_THD(thd, ER_DATA_OVERFLOW),
+                        ErrConvDouble(nr).ptr(), "SIGNED BIGINT");
+  }
+  return conv.result();
+}
+
+
+longlong Item::val_int_unsigned_typecast_from_real()
+{
+  double nr= val_real();
+  if (null_value)
+    return 0;
+  Converter_double_to_longlong conv(nr, true);
+  if (conv.error())
+  {
+    THD *thd= current_thd;
+    push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE,
+                        ER_DATA_OVERFLOW, ER_THD(thd, ER_DATA_OVERFLOW),
+                        ErrConvDouble(nr).ptr(), "UNSIGNED BIGINT");
+  }
+  return conv.result();
+}
+
+
+longlong Item::val_int_signed_typecast_from_int()
+{
+  longlong value= val_int();
+  if (!null_value && unsigned_flag && value < 0)
+    push_note_converted_to_negative_complement(current_thd);
   return value;
 }
 
@@ -837,7 +880,7 @@ bool Item_field::register_field_in_write_map(void *arg)
 }
 
 /**
-  Check that we are not refering to any not yet initialized fields
+  Check that we are not referring to any not yet initialized fields
 
   Fields are initialized in this order:
   - All fields that have default value as a constant are initialized first.
@@ -2832,8 +2875,6 @@ Item_sp::init_result_field(THD *thd, uint max_length, uint maybe_null,
 
 Item* Item_ref::build_clone(THD *thd)
 {
-  if (thd->having_pushdown)
-    return real_item()->build_clone(thd);
   Item_ref *copy= (Item_ref *) get_copy(thd);
   if (unlikely(!copy) ||
       unlikely(!(copy->ref= (Item**) alloc_root(thd->mem_root,
@@ -4696,7 +4737,7 @@ void
 Item_param::set_out_param_info(Send_field *info)
 {
   m_out_param_info= info;
-  set_handler_by_field_type(m_out_param_info->type);
+  set_handler(m_out_param_info->type_handler());
 }
 
 
@@ -4737,16 +4778,7 @@ void Item_param::make_send_field(THD *thd, Send_field *field)
     OUT-parameter info to fill out the names.
   */
 
-  field->db_name= m_out_param_info->db_name;
-  field->table_name= m_out_param_info->table_name;
-  field->org_table_name= m_out_param_info->org_table_name;
-  field->col_name= m_out_param_info->col_name;
-  field->org_col_name= m_out_param_info->org_col_name;
-
-  field->length= m_out_param_info->length;
-  field->flags= m_out_param_info->flags;
-  field->decimals= m_out_param_info->decimals;
-  field->type= m_out_param_info->type;
+  *field= *m_out_param_info;
 }
 
 bool Item_param::append_for_log(THD *thd, String *str)
@@ -6124,7 +6156,7 @@ Item *Item_field::replace_equal_field(THD *thd, uchar *arg)
 
 
 void Item::init_make_send_field(Send_field *tmp_field,
-                                enum enum_field_types field_type_arg)
+                                const Type_handler *h)
 {
   tmp_field->db_name=		"";
   tmp_field->org_table_name=	"";
@@ -6134,7 +6166,7 @@ void Item::init_make_send_field(Send_field *tmp_field,
   tmp_field->flags=             (maybe_null ? 0 : NOT_NULL_FLAG) | 
                                 (my_binary_compare(charset_for_protocol()) ?
                                  BINARY_FLAG : 0);
-  tmp_field->type=              field_type_arg;
+  tmp_field->set_handler(h);
   tmp_field->length=max_length;
   tmp_field->decimals=decimals;
   if (unsigned_flag)
@@ -6143,13 +6175,13 @@ void Item::init_make_send_field(Send_field *tmp_field,
 
 void Item::make_send_field(THD *thd, Send_field *tmp_field)
 {
-  init_make_send_field(tmp_field, field_type());
+  init_make_send_field(tmp_field, type_handler());
 }
 
 
 void Item_empty_string::make_send_field(THD *thd, Send_field *tmp_field)
 {
-  init_make_send_field(tmp_field, string_type_handler()->field_type());
+  init_make_send_field(tmp_field, string_type_handler());
 }
 
 
@@ -7204,8 +7236,9 @@ void Item::check_pushable_cond(Pushdown_checker checker, uchar *arg)
     Build condition extractable from this condition for pushdown
 
   @param thd      the thread handle
-  @param checker  the checker callback function to be applied to the
-                  equal items of multiple equality items
+  @param checker  the checker callback function to be applied to the nodes
+                  of the tree of the object to check if multiple equality
+                  elements can be used to create equalities
   @param arg      parameter to be passed to the checker
 
   @details
@@ -7308,19 +7341,6 @@ Item *Item::build_pushable_cond(THD *thd,
                                                          checker, arg) ||
         (equalities.elements == 0))
       return 0;
-
-    if (thd->having_pushdown)
-    {
-      /* Creates multiple equalities from equalities that can be pushed */
-      Item::cond_result cond_value;
-      COND_EQUAL *cond_equal= new (thd->mem_root) COND_EQUAL();
-      new_cond= and_new_conditions_to_optimized_cond(thd, new_cond,
-                                                     &cond_equal,
-                                                     equalities,
-                                                     &cond_value,
-                                                     false);
-      return new_cond;
-    }
 
     switch (equalities.elements)
     {
@@ -7490,15 +7510,6 @@ Item *Item_field::grouping_field_transformer_for_where(THD *thd, uchar *arg)
     return producing_clone;
   }
   return this;
-}
-
-
-bool Item::pushable_equality_checker_for_having_pushdown(uchar *arg)
-{
-  return (type() == Item::FIELD_ITEM ||
-          (type() == Item::REF_ITEM &&
-          ((((Item_ref *) this)->ref_type() == Item_ref::VIEW_REF) ||
-          (((Item_ref *) this)->ref_type() == Item_ref::REF))));
 }
 
 
@@ -9088,28 +9099,16 @@ bool Item_direct_view_ref::excl_dep_on_grouping_fields(st_select_lex *sel)
 }
 
 
-bool Item_direct_view_ref::excl_dep_on_group_fields_for_having_pushdown(st_select_lex *sel)
-{
-  if (item_equal)
-  {
-    DBUG_ASSERT(real_item()->type() == Item::FIELD_ITEM);
-    return (find_matching_field_pair(this, sel->grouping_tmp_fields) != NULL);
-  }
-  return (*ref)->excl_dep_on_group_fields_for_having_pushdown(sel);
-}
-
-
-bool Item_args::excl_dep_on_group_fields_for_having_pushdown(st_select_lex *sel)
+bool Item_args::excl_dep_on_grouping_fields(st_select_lex *sel)
 {
   for (uint i= 0; i < arg_count; i++)
   {
-    if (args[i]->type() == Item::SUBSELECT_ITEM ||
-        (args[i]->type() == Item::FUNC_ITEM &&
-         ((Item_func *)args[i])->functype() == Item_func::UDF_FUNC))
+    if (args[i]->type() == Item::FUNC_ITEM &&
+        ((Item_func *)args[i])->functype() == Item_func::UDF_FUNC)
       return false;
     if (args[i]->const_item())
       continue;
-    if (!args[i]->excl_dep_on_group_fields_for_having_pushdown(sel))
+    if (!args[i]->excl_dep_on_grouping_fields(sel))
       return false;
   }
   return true;
@@ -9964,11 +9963,20 @@ longlong Item_cache_real::val_int()
 }
 
 
-String* Item_cache_real::val_str(String *str)
+String* Item_cache_double::val_str(String *str)
 {
   if (!has_value())
     return NULL;
   str->set_real(value, decimals, default_charset());
+  return str;
+}
+
+
+String* Item_cache_float::val_str(String *str)
+{
+  if (!has_value())
+    return NULL;
+  Float(value).to_string(str, decimals);
   return str;
 }
 

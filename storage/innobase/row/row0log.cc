@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 2011, 2018, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2017, 2018, MariaDB Corporation.
+Copyright (c) 2017, 2019, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -13,7 +13,7 @@ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
-51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -41,6 +41,14 @@ Created 2011-05-26 Marko Makela
 #include <sql_class.h>
 #include <algorithm>
 #include <map>
+
+#ifdef HAVE_WOLFSSL
+// Workaround for MDEV-19582
+// (WolfSSL reads memory out of bounds with decryption/NOPAD)
+#define WOLFSSL_PAD_SIZE MY_AES_BLOCK_SIZE
+#else
+#define WOLFSSL_PAD_SIZE 0
+#endif
 
 Atomic_counter<ulint> onlineddl_rowlog_rows;
 ulint onlineddl_rowlog_pct_used;
@@ -293,7 +301,8 @@ row_log_block_allocate(
 		);
 
 		log_buf.block = ut_allocator<byte>(mem_key_row_log_buf)
-			.allocate_large(srv_sort_buf_size, &log_buf.block_pfx);
+			.allocate_large(srv_sort_buf_size + WOLFSSL_PAD_SIZE,
+					&log_buf.block_pfx);
 
 		if (log_buf.block == NULL) {
 			DBUG_RETURN(false);
@@ -313,7 +322,8 @@ row_log_block_free(
 	DBUG_ENTER("row_log_block_free");
 	if (log_buf.block != NULL) {
 		ut_allocator<byte>(mem_key_row_log_buf).deallocate_large(
-			log_buf.block, &log_buf.block_pfx, log_buf.size);
+			log_buf.block, &log_buf.block_pfx,
+			log_buf.size + WOLFSSL_PAD_SIZE);
 		log_buf.block = NULL;
 	}
 	DBUG_VOID_RETURN;
@@ -445,11 +455,12 @@ row_log_online_op(
 		}
 
 		log->tail.blocks++;
-		if (!os_file_write(
+		if (os_file_write(
 			    request,
 			    "(modification log)",
 			    log->fd,
-			    buf, byte_offset, srv_sort_buf_size)) {
+			    buf, byte_offset, srv_sort_buf_size)
+		    != DB_SUCCESS) {
 write_failed:
 			/* We set the flag directly instead of invoking
 			dict_set_corrupted_index_cache_only(index) here,
@@ -583,11 +594,12 @@ row_log_table_close_func(
 		}
 
 		log->tail.blocks++;
-		if (!os_file_write(
+		if (os_file_write(
 			    request,
 			    "(modification log)",
 			    log->fd,
-			    buf, byte_offset, srv_sort_buf_size)) {
+			    buf, byte_offset, srv_sort_buf_size)
+		    != DB_SUCCESS) {
 write_failed:
 			log->error = DB_ONLINE_LOG_TOO_BIG;
 		}
@@ -963,7 +975,8 @@ row_log_table_low(
 		break;
 	case FIL_PAGE_TYPE_INSTANT:
 		ut_ad(index->is_instant());
-		ut_ad(page_is_root(page_align(rec)));
+		ut_ad(!page_has_siblings(page_align(rec)));
+		ut_ad(page_get_page_no(page_align(rec)) == index->page);
 		break;
 	default:
 		ut_ad(!"wrong page type");
@@ -2861,9 +2874,9 @@ all_done:
 		IORequest		request(IORequest::READ);
 		byte*			buf = index->online_log->head.block;
 
-		if (!os_file_read_no_error_handling(
+		if (os_file_read_no_error_handling(
 			    request, index->online_log->fd,
-			    buf, ofs, srv_sort_buf_size, 0)) {
+			    buf, ofs, srv_sort_buf_size, 0) != DB_SUCCESS) {
 			ib::error()
 				<< "Unable to read temporary file"
 				" for table " << index->table->name;
@@ -3108,7 +3121,7 @@ row_log_table_apply(
 
 	stage->begin_phase_log_table();
 
-	ut_ad(!rw_lock_own(dict_operation_lock, RW_LOCK_S));
+	ut_ad(!rw_lock_own(&dict_sys.latch, RW_LOCK_S));
 	clust_index = dict_table_get_first_index(old_table);
 
 	if (clust_index->online_log->n_rows == 0) {
@@ -3228,7 +3241,7 @@ row_log_allocate(
 	index->online_log = log;
 
 	if (log_tmp_is_encrypted()) {
-		ulint size = srv_sort_buf_size;
+		ulint size = srv_sort_buf_size + WOLFSSL_PAD_SIZE;
 		log->crypt_head = static_cast<byte *>(os_mem_alloc_large(&size));
 		log->crypt_tail = static_cast<byte *>(os_mem_alloc_large(&size));
 
@@ -3262,11 +3275,13 @@ row_log_free(
 	row_merge_file_destroy_low(log->fd);
 
 	if (log->crypt_head) {
-		os_mem_free_large(log->crypt_head, srv_sort_buf_size);
+		os_mem_free_large(log->crypt_head, srv_sort_buf_size
+				  + WOLFSSL_PAD_SIZE);
 	}
 
 	if (log->crypt_tail) {
-		os_mem_free_large(log->crypt_tail, srv_sort_buf_size);
+		os_mem_free_large(log->crypt_tail, srv_sort_buf_size
+				  + WOLFSSL_PAD_SIZE);
 	}
 
 	mutex_free(&log->mutex);
@@ -3765,9 +3780,9 @@ all_done:
 
 		byte*	buf = index->online_log->head.block;
 
-		if (!os_file_read_no_error_handling(
+		if (os_file_read_no_error_handling(
 			    request, index->online_log->fd,
-			    buf, ofs, srv_sort_buf_size, 0)) {
+			    buf, ofs, srv_sort_buf_size, 0) != DB_SUCCESS) {
 			ib::error()
 				<< "Unable to read temporary file"
 				" for index " << index->name;

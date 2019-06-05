@@ -15,7 +15,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1335  USA */
 
 
 #include <mysql_version.h>                      /* FRM_VER */
@@ -183,10 +183,6 @@ enum extra2_field_flags {
   VERS_OPTIMIZED_UPDATE= 1 << INVISIBLE_MAX_BITS,
 };
 
-int rea_create_table(THD *thd, LEX_CUSTRING *frm,
-                     const char *path, const char *db, const char *table_name,
-                     HA_CREATE_INFO *create_info, handler *file,
-                     bool no_ha_create_table);
 LEX_CUSTRING build_frm_image(THD *thd, const LEX_CSTRING &table,
                              HA_CREATE_INFO *create_info,
                              List<Create_field> &create_fields,

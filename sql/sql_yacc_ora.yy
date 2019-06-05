@@ -1433,7 +1433,8 @@ bool my_yyoverflow(short **a, YYSTYPE **b, size_t *yystacksize);
 %type <table_list>
         join_table_list  join_table
         table_factor table_ref esc_table_ref
-        table_primary_ident table_primary_derived
+        table_primary_ident table_primary_ident_opt_parens
+        table_primary_derived table_primary_derived_opt_parens
         derived_table_list table_reference_list_parens
         nested_table_reference_list join_table_parens
         update_table_list
@@ -3410,12 +3411,8 @@ optionally_qualified_column_ident:
 row_field_name:
           ident_directly_assignable
           {
-            if (unlikely(check_string_char_length(&$1, 0, NAME_CHAR_LEN,
-                                                  system_charset_info, 1)))
-              my_yyabort_error((ER_TOO_LONG_IDENT, MYF(0), $1.str));
-            if (unlikely(!($$= new (thd->mem_root) Spvar_definition())))
+            if (!($$= Lex->row_field_name(thd, $1)))
               MYSQL_YYABORT;
-            Lex->init_last_field($$, &$1, thd->variables.collation_database);
           }
         ;
 
@@ -3426,17 +3423,12 @@ row_field_definition:
 row_field_definition_list:
           row_field_definition
           {
-            if (unlikely(!($$= new (thd->mem_root) Row_definition_list())) ||
-                unlikely($$->push_back($1, thd->mem_root)))
+            if (!($$= Row_definition_list::make(thd->mem_root, $1)))
               MYSQL_YYABORT;
           }
         | row_field_definition_list ',' row_field_definition
           {
-            uint unused;
-            if (unlikely($1->find_row_field_by_name(&$3->field_name, &unused)))
-              my_yyabort_error((ER_DUP_FIELDNAME, MYF(0), $3->field_name.str));
-            $$= $1;
-            if (unlikely($$->push_back($3, thd->mem_root)))
+            if (($$= $1)->append_uniq(thd->mem_root, $3))
               MYSQL_YYABORT;
           }
         ;
@@ -6007,12 +5999,7 @@ opt_versioning_rotation:
          {
            partition_info *part_info= Lex->part_info;
            if (unlikely(part_info->vers_set_interval(thd, $2, $3, $4)))
-           {
-             my_error(ER_PART_WRONG_VALUE, MYF(0),
-                      Lex->create_last_non_select_table->table_name.str,
-                      "INTERVAL");
              MYSQL_YYABORT;
-           }
          }
        | LIMIT ulonglong_num
        {
@@ -6379,7 +6366,7 @@ versioning_option:
             {
               if (DBUG_EVALUATE_IF("sysvers_force", 0, 1))
               {
-                my_error(ER_VERS_TEMPORARY, MYF(0));
+                my_error(ER_VERS_NOT_SUPPORTED, MYF(0), "CREATE TEMPORARY TABLE");
                 MYSQL_YYABORT;
               }
             }
@@ -9247,7 +9234,7 @@ select:
           opt_procedure_or_into
           {
             Lex->pop_select();
-            if (Lex->select_finalize($1))
+            if (Lex->select_finalize($1, $3))
               MYSQL_YYABORT;
           }
         | with_clause query_expression_body
@@ -9262,7 +9249,7 @@ select:
             Lex->pop_select();
             $2->set_with_clause($1);
             $1->attach_to($2->first_select());
-            if (Lex->select_finalize($2))
+            if (Lex->select_finalize($2, $4))
               MYSQL_YYABORT;
           }
         ;
@@ -9528,6 +9515,7 @@ for_portion_of_time_clause:
                                         Vers_history_point(VERS_TIMESTAMP, $9),
                                         $5);
           }
+        ;
 
 opt_for_portion_of_time_clause:
           /* empty */
@@ -11855,6 +11843,7 @@ cast_type_numeric:
         | UNSIGNED                       { $$.set(&type_handler_ulonglong); }
         | UNSIGNED INT_SYM               { $$.set(&type_handler_ulonglong); }
         | DECIMAL_SYM float_options      { $$.set(&type_handler_newdecimal, $2); }
+        | FLOAT_SYM                      { $$.set(&type_handler_float); }
         | DOUBLE_SYM opt_precision       { $$.set(&type_handler_double, $2);  }
         ;
 
@@ -12174,14 +12163,26 @@ use_partition:
           PARTITION_SYM '(' using_list ')' have_partitioning
           {
             $$= $3;
+            Select->parsing_place= Select->save_parsing_place;
+            Select->save_parsing_place= NO_MATTER;
           }
         ;
 
 table_factor:
-          table_primary_ident { $$= $1; }
-        | table_primary_derived { $$= $1; }
+          table_primary_ident_opt_parens { $$= $1; }
+        | table_primary_derived_opt_parens { $$= $1; }
         | join_table_parens { $$= $1; }
         | table_reference_list_parens { $$= $1; }
+        ;
+
+table_primary_ident_opt_parens:
+          table_primary_ident { $$= $1; }
+        | '(' table_primary_ident_opt_parens ')' { $$= $2; }
+        ;
+
+table_primary_derived_opt_parens:
+          table_primary_derived { $$= $1; }
+        | '(' table_primary_derived_opt_parens ')' { $$= $2; }
         ;
 
 table_reference_list_parens:
@@ -13413,7 +13414,7 @@ insert:
           insert_lock_option
           opt_ignore insert2
           {
-            Select->set_lock_for_tables($3);
+            Select->set_lock_for_tables($3, true);
             Lex->current_select= Lex->first_select_lex();
           }
           insert_field_spec opt_insert_update
@@ -13437,7 +13438,7 @@ replace:
           }
           replace_lock_option insert2
           {
-            Select->set_lock_for_tables($3);
+            Select->set_lock_for_tables($3, true);
             Lex->current_select= Lex->first_select_lex();
           }
           insert_field_spec
@@ -13485,13 +13486,17 @@ insert2:
         ;
 
 insert_table:
+          {
+            Select->save_parsing_place= Select->parsing_place;
+          }
           table_name_with_opt_use_partition
           {
             LEX *lex=Lex;
             //lex->field_list.empty();
             lex->many_values.empty();
             lex->insert_list=0;
-          };
+          }
+        ;
 
 insert_field_spec:
           insert_values {}
@@ -13706,15 +13711,14 @@ update:
           opt_low_priority opt_ignore update_table_list
           SET update_list
           {
-            LEX *lex= Lex;
-            if (lex->first_select_lex()->table_list.elements > 1)
-              lex->sql_command= SQLCOM_UPDATE_MULTI;
-            else if (lex->first_select_lex()->get_table_list()->derived)
+            SELECT_LEX *slex= Lex->first_select_lex();
+            if (slex->table_list.elements > 1)
+              Lex->sql_command= SQLCOM_UPDATE_MULTI;
+            else if (slex->get_table_list()->derived)
             {
               /* it is single table update and it is update of derived table */
               my_error(ER_NON_UPDATABLE_TABLE, MYF(0),
-                       lex->first_select_lex()->get_table_list()->alias.str,
-                       "UPDATE");
+                       slex->get_table_list()->alias.str, "UPDATE");
               MYSQL_YYABORT;
             }
             /*
@@ -13722,7 +13726,7 @@ update:
               be too pessimistic. We will decrease lock level if possible in
               mysql_multi_update().
             */
-            Select->set_lock_for_tables($3);
+            slex->set_lock_for_tables($3, slex->table_list.elements == 1);
           }
           opt_where_clause opt_order_clause delete_limit_clause
           {
@@ -16906,13 +16910,16 @@ table_lock:
           {
             thr_lock_type lock_type= (thr_lock_type) $3;
             bool lock_for_write= (lock_type >= TL_WRITE_ALLOW_WRITE);
+            ulong table_options= lock_for_write ? TL_OPTION_UPDATING : 0;
+            enum_mdl_type mdl_type= !lock_for_write
+                                    ? MDL_SHARED_READ
+                                    : lock_type == TL_WRITE_CONCURRENT_INSERT
+                                      ? MDL_SHARED_WRITE
+                                      : MDL_SHARED_NO_READ_WRITE;
+
             if (unlikely(!Select->
-                         add_table_to_list(thd, $1, $2, 0, lock_type,
-                                           (lock_for_write ?
-                                            lock_type == TL_WRITE_CONCURRENT_INSERT ?
-                                            MDL_SHARED_WRITE :
-                                            MDL_SHARED_NO_READ_WRITE :
-                                            MDL_SHARED_READ))))
+                         add_table_to_list(thd, $1, $2, table_options,
+                                           lock_type, mdl_type)))
               MYSQL_YYABORT;
           }
         ;

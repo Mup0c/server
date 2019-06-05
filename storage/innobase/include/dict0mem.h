@@ -14,7 +14,7 @@ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
-51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -705,9 +705,6 @@ struct dict_v_idx_t {
 		: index(index), nth_field(nth_field) {}
 };
 
-/** Index list to put in dict_v_col_t */
-typedef	std::list<dict_v_idx_t, ut_allocator<dict_v_idx_t> >	dict_v_idx_list;
-
 /** Data structure for a virtual column in a table */
 struct dict_v_col_t{
 	/** column structure */
@@ -717,15 +714,39 @@ struct dict_v_col_t{
 	dict_col_t**		base_col;
 
 	/** number of base column */
-	ulint			num_base;
+	unsigned		num_base:10;
 
 	/** column pos in table */
-	ulint			v_pos;
+	unsigned		v_pos:10;
 
-	/** Virtual index list, and column position in the index,
-	the allocated memory is not from table->heap */
-	dict_v_idx_list*	v_indexes;
+	/** number of indexes */
+	unsigned		n_v_indexes:12;
 
+	/** Virtual index list, and column position in the index */
+	std::forward_list<dict_v_idx_t, ut_allocator<dict_v_idx_t> >
+	v_indexes;
+
+	/** Detach the column from an index.
+	@param[in]	index	index to be detached from */
+	void detach(const dict_index_t& index)
+	{
+		if (!n_v_indexes) return;
+		auto i = v_indexes.before_begin();
+		ut_d(unsigned n = 0);
+		do {
+			auto prev = i++;
+			if (i == v_indexes.end()) {
+				ut_ad(n == n_v_indexes);
+				return;
+			}
+			ut_ad(++n <= n_v_indexes);
+			if (i->index == &index) {
+				v_indexes.erase_after(prev);
+				n_v_indexes--;
+				return;
+			}
+		} while (i != v_indexes.end());
+	}
 };
 
 /** Data structure for newly added virtual column in a table */
@@ -753,7 +774,8 @@ struct dict_s_col_t {
 };
 
 /** list to put stored column for create_table_info_t */
-typedef std::list<dict_s_col_t, ut_allocator<dict_s_col_t> >	dict_s_col_list;
+typedef std::forward_list<dict_s_col_t, ut_allocator<dict_s_col_t> >
+dict_s_col_list;
 
 /** @brief DICT_ANTELOPE_MAX_INDEX_COL_LEN is measured in bytes and
 is the maximum indexed column length (or indexed prefix length) in
@@ -948,13 +970,13 @@ struct dict_index_t {
 				dictionary cache */
 	unsigned	to_be_dropped:1;
 				/*!< TRUE if the index is to be dropped;
-				protected by dict_operation_lock */
+				protected by dict_sys.latch */
 	unsigned	online_status:2;
 				/*!< enum online_index_status.
 				Transitions from ONLINE_INDEX_COMPLETE (to
 				ONLINE_INDEX_CREATION) are protected
-				by dict_operation_lock and
-				dict_sys->mutex. Other changes are
+				by dict_sys.latch and
+				dict_sys.mutex. Other changes are
 				protected by index->lock. */
 	unsigned	uncommitted:1;
 				/*!< a flag that is set for secondary indexes
@@ -964,6 +986,8 @@ struct dict_index_t {
 #ifdef UNIV_DEBUG
 	/** whether this is a dummy index object */
 	bool		is_dummy;
+	/** whether btr_cur_instant_init() is in progress */
+	bool		in_instant_init;
 	uint32_t	magic_n;/*!< magic number */
 /** Value of dict_index_t::magic_n */
 # define DICT_INDEX_MAGIC_N	76789786
@@ -1209,19 +1233,8 @@ struct dict_index_t {
 @param[in]	index	index to be detached from */
 inline void dict_col_t::detach(const dict_index_t& index)
 {
-	if (!is_virtual()) {
-		return;
-	}
-
-	if (dict_v_idx_list* v_indexes = reinterpret_cast<const dict_v_col_t*>
-	    (this)->v_indexes) {
-		for (dict_v_idx_list::iterator i = v_indexes->begin();
-		     i != v_indexes->end(); i++) {
-			if (i->index == &index) {
-				v_indexes->erase(i);
-				return;
-			}
-		}
+	if (is_virtual()) {
+		reinterpret_cast<dict_v_col_t*>(this)->detach(index);
 	}
 }
 
@@ -1647,6 +1660,13 @@ struct dict_table_t {
 		return(UNIV_LIKELY(!file_unreadable));
 	}
 
+	/** Check if a table name contains the string "/#sql"
+	which denotes temporary or intermediate tables in MariaDB. */
+	static bool is_temporary_name(const char* name)
+	{
+		return strstr(name, "/" TEMP_FILE_PREFIX) != NULL;
+	}
+
 	/** @return whether instant ALTER TABLE is in effect */
 	bool is_instant() const
 	{
@@ -1826,8 +1846,7 @@ public:
 	/** TRUE if the table is to be dropped, but not yet actually dropped
 	(could in the background drop list). It is turned on at the beginning
 	of row_drop_table_for_mysql() and turned off just before we start to
-	update system tables for the drop. It is protected by
-	dict_operation_lock. */
+	update system tables for the drop. It is protected by dict_sys.latch. */
 	unsigned				to_be_dropped:1;
 
 	/** Number of non-virtual columns defined so far. */
@@ -2042,7 +2061,7 @@ public:
 
 	/** The state of the background stats thread wrt this table.
 	See BG_STAT_NONE, BG_STAT_IN_PROGRESS and BG_STAT_SHOULD_QUIT.
-	Writes are covered by dict_sys->mutex. Dirty reads are possible. */
+	Writes are covered by dict_sys.mutex. Dirty reads are possible. */
 
 	#define BG_SCRUB_IN_PROGRESS	((byte)(1 << 2))
 				/*!< BG_SCRUB_IN_PROGRESS is set in
@@ -2058,7 +2077,7 @@ public:
 
 	/** The state of the background stats thread wrt this table.
 	See BG_STAT_NONE, BG_STAT_IN_PROGRESS and BG_STAT_SHOULD_QUIT.
-	Writes are covered by dict_sys->mutex. Dirty reads are possible. */
+	Writes are covered by dict_sys.mutex. Dirty reads are possible. */
 	byte					stats_bg_flag;
 
 	bool		stats_error_printed;
@@ -2148,6 +2167,11 @@ public:
 inline void dict_index_t::set_modified(mtr_t& mtr) const
 {
 	mtr.set_named_space(table->space);
+}
+
+inline bool table_name_t::is_temporary() const
+{
+	return dict_table_t::is_temporary_name(m_name);
 }
 
 inline bool dict_index_t::is_readable() const { return table->is_readable(); }

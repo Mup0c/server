@@ -13,7 +13,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335  USA
 */
 
 /*
@@ -509,56 +509,6 @@ err:
 }
 
 
-/**
-  Create a frm (table definition) file and the tables
-
-  @param thd           Thread handler
-  @param frm           Binary frm image of the table to create
-  @param path          Name of file (including database, without .frm)
-  @param db            Data base name
-  @param table_name    Table name
-  @param create_info   create info parameters
-  @param file          Handler to use or NULL if only frm needs to be created
-
-  @retval 0   ok
-  @retval 1   error
-*/
-
-int rea_create_table(THD *thd, LEX_CUSTRING *frm,
-                     const char *path, const char *db, const char *table_name,
-                     HA_CREATE_INFO *create_info, handler *file,
-                     bool no_ha_create_table)
-{
-  DBUG_ENTER("rea_create_table");
-
-  if (no_ha_create_table)
-  {
-    if (writefrm(path, db, table_name, true, frm->str, frm->length))
-      goto err_frm;
-  }
-
-  if (thd->variables.keep_files_on_create)
-    create_info->options|= HA_CREATE_KEEP_FILES;
-
-  if (file->ha_create_partitioning_metadata(path, NULL, CHF_CREATE_FLAG))
-    goto err_part;
-
-  if (!no_ha_create_table)
-  {
-    if (ha_create_table(thd, path, db, table_name, create_info, frm))
-      goto err_part;
-  }
-
-  DBUG_RETURN(0);
-
-err_part:
-  file->ha_create_partitioning_metadata(path, NULL, CHF_DELETE_FLAG);
-err_frm:
-  deletefrm(path);
-  DBUG_RETURN(1);
-} /* rea_create_table */
-
-
 /* Pack keyinfo and keynames to keybuff for save in form-file. */
 
 static uint pack_keys(uchar *keybuff, uint key_count, KEY *keyinfo,
@@ -1024,13 +974,36 @@ static bool pack_fields(uchar **buff_arg, List<Create_field> &create_fields,
   DBUG_RETURN(0);
 }
 
+
+static bool make_empty_rec_store_default(THD *thd, Field *regfield,
+                                         Virtual_column_info *default_value)
+{
+  if (default_value && !default_value->flags)
+  {
+    Item *expr= default_value->expr;
+    // may be already fixed if ALTER TABLE
+    if (expr->fix_fields_if_needed(thd, &expr))
+      return true;
+    DBUG_ASSERT(expr == default_value->expr); // Should not change
+    if (regfield->make_empty_rec_store_default_value(thd, expr))
+    {
+      my_error(ER_INVALID_DEFAULT, MYF(0), regfield->field_name.str);
+      return true;
+    }
+    return false;
+  }
+  regfield->make_empty_rec_reset(thd);
+  return false;
+}
+
+
 /* save an empty record on start of formfile */
 
 static bool make_empty_rec(THD *thd, uchar *buff, uint table_options,
 			   List<Create_field> &create_fields,
 			   uint reclength, ulong data_offset)
 {
-  int error= 0;
+  int error= false;
   uint null_count;
   uchar *null_pos;
   TABLE table;
@@ -1070,7 +1043,7 @@ static bool make_empty_rec(THD *thd, uchar *buff, uint table_options,
                                     field->flags);
     if (!regfield)
     {
-      error= 1;
+      error= true;
       goto err;                                 // End of memory
     }
 
@@ -1087,36 +1060,10 @@ static bool make_empty_rec(THD *thd, uchar *buff, uint table_options,
         !f_bit_as_char(field->pack_flag))
       null_count+= field->length & 7;
 
-    if (field->default_value && !field->default_value->flags &&
-        (!(field->flags & BLOB_FLAG) ||
-         field->real_field_type() == MYSQL_TYPE_GEOMETRY))
-    {
-      Item *expr= field->default_value->expr;
-      // may be already fixed if ALTER TABLE
-      int res= expr->fix_fields_if_needed(thd, &expr);
-      if (!res)
-        res= expr->save_in_field(regfield, 1);
-      if (!res && (field->flags & BLOB_FLAG))
-        regfield->reset();
-
-      /* If not ok or warning of level 'note' */
-      if (res != 0 && res != 3)
-      {
-        my_error(ER_INVALID_DEFAULT, MYF(0), regfield->field_name.str);
-        error= 1;
-        delete regfield; //To avoid memory leak
-        goto err;
-      }
-      delete regfield; //To avoid memory leak
-    }
-    else if (regfield->real_type() == MYSQL_TYPE_ENUM &&
-	     (field->flags & NOT_NULL_FLAG))
-    {
-      regfield->set_notnull();
-      regfield->store((longlong) 1, TRUE);
-    }
-    else
-      regfield->reset();
+    error= make_empty_rec_store_default(thd, regfield, field->default_value);
+    delete regfield; // Avoid memory leaks
+    if (error)
+      goto err;
   }
   DBUG_ASSERT(data_offset == ((null_count + 7) / 8));
 

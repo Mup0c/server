@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1996, 2018, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2018, MariaDB Corporation.
+Copyright (c) 2018, 2019, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -13,7 +13,7 @@ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
-51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -62,6 +62,10 @@ static bool row_build_spatial_index_key(
 	ulint			flag,
 	mem_heap_t*		heap)
 {
+	if (dfield2->type.mtype == DATA_MISSING) {
+		return false;
+	}
+
 	double*			mbr;
 
 	dfield_copy(dfield, dfield2);
@@ -83,20 +87,22 @@ static bool row_build_spatial_index_key(
 		return true;
 	}
 
-	uchar*	dptr = NULL;
+	const byte* dptr = NULL;
 	ulint	dlen = 0;
 	ulint	flen = 0;
 	double	tmp_mbr[SPDIMS * 2];
 	mem_heap_t*	temp_heap = NULL;
 
 	if (!dfield_is_ext(dfield2)) {
-		dptr = static_cast<uchar*>(dfield_get_data(dfield2));
+		dptr = static_cast<const byte*>(dfield_get_data(dfield2));
 		dlen = dfield_get_len(dfield2);
+		ut_ad(dptr != &data_error);
 		goto write_mbr;
 	}
 
 	if (flag == ROW_BUILD_FOR_PURGE) {
-		byte*	ptr = static_cast<byte*>(dfield_get_data(dfield2));
+		const byte* ptr = static_cast<const byte*>(
+			dfield_get_data(dfield2));
 
 		switch (dfield_get_spatial_status(dfield2)) {
 		case SPATIAL_ONLY:
@@ -140,12 +146,12 @@ static bool row_build_spatial_index_key(
 		log record, and avoid recomputing it here! */
 		flen = BTR_EXTERN_FIELD_REF_SIZE;
 		ut_ad(dfield_get_len(dfield2) >= BTR_EXTERN_FIELD_REF_SIZE);
-		dptr = static_cast<byte*>(dfield_get_data(dfield2))
+		dptr = static_cast<const byte*>(dfield_get_data(dfield2))
 			+ dfield_get_len(dfield2)
 			- BTR_EXTERN_FIELD_REF_SIZE;
 	} else {
 		flen = dfield_get_len(dfield2);
-		dptr = static_cast<byte*>(dfield_get_data(dfield2));
+		dptr = static_cast<const byte*>(dfield_get_data(dfield2));
 	}
 
 	temp_heap = mem_heap_create(1000);
@@ -1112,9 +1118,6 @@ row_build_row_ref_in_tuple(
 	ulint			offsets_[REC_OFFS_NORMAL_SIZE];
 	rec_offs_init(offsets_);
 
-	ut_a(ref);
-	ut_a(index);
-	ut_a(rec);
 	ut_ad(!dict_index_is_clust(index));
 	ut_a(index->table);
 

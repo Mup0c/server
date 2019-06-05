@@ -11,7 +11,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02111-1301 USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA */
 
 #include "wsrep_var.h"
 
@@ -676,6 +676,14 @@ bool wsrep_trx_fragment_size_check (sys_var *self, THD* thd, set_var* var)
                   "Cannot set 'wsrep_trx_fragment_size' to a value other than "
                   "0 because the wsrep_provider does not support streaming "
                   "replication.");
+    return true;
+  }
+
+  if (wsrep_protocol_version < 4  && new_trx_fragment_size > 0) {
+    push_warning (thd, Sql_condition::WARN_LEVEL_WARN,
+                  ER_WRONG_VALUE_FOR_VAR,
+                  "Cannot set 'wsrep_trx_fragment_size' to a value other than "
+                  "0 because cluster is not yet operating in Galera 4 mode.");
     return true;
   }
 

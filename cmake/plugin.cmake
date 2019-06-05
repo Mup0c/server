@@ -12,7 +12,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA 
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1335  USA 
 
 
 INCLUDE(CMakeParseArguments)
@@ -233,9 +233,6 @@ MACRO(MYSQL_ADD_PLUGIN)
         IF (NOT ARG_CLIENT)
           SET(CPACK_RPM_${ARG_COMPONENT}_PACKAGE_REQUIRES "MariaDB-server${ver}" PARENT_SCOPE)
         ENDIF()
-        # workarounds for cmake issues #13248 and #12864:
-        SET(CPACK_RPM_${ARG_COMPONENT}_PACKAGE_PROVIDES "cmake_bug_13248" PARENT_SCOPE)
-        SET(CPACK_RPM_${ARG_COMPONENT}_PACKAGE_OBSOLETES "cmake_bug_13248" PARENT_SCOPE)
         SET(CPACK_RPM_${ARG_COMPONENT}_USER_FILELIST ${ignored} PARENT_SCOPE)
         IF(NOT ARG_CLIENT AND UNIX)
           IF (NOT ARG_CONFIG)

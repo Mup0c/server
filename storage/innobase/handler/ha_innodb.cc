@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2000, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2000, 2019, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2008, 2009 Google Inc.
 Copyright (c) 2009, Percona Inc.
 Copyright (c) 2012, Facebook Inc.
@@ -29,7 +29,7 @@ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
-51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -145,9 +145,6 @@ void close_thread_tables(THD* thd);
 #include "dict0priv.h"
 #include <mysql/service_md5.h>
 #include "wsrep_sst.h"
-
-extern MYSQL_PLUGIN_IMPORT MYSQL_BIN_LOG mysql_bin_log;
-
 #endif /* WITH_WSREP */
 
 /** to force correct commit order in binlog */
@@ -236,12 +233,6 @@ static
 void set_my_errno(int err)
 {
 	errno = err;
-}
-
-static uint omits_virtual_cols(const TABLE_SHARE &share)
-{
-	return share.frm_version < FRM_VER_EXPRESSSIONS &&
-	       share.virtual_fields;
 }
 
 /** Checks whether the file name belongs to a partition of a table.
@@ -1837,7 +1828,7 @@ thd_innodb_tmpdir(
 @return reference to transaction pointer */
 static trx_t* thd_to_trx(THD* thd)
 {
-	return *reinterpret_cast<trx_t**>(thd_ha_data(thd, innodb_hton_ptr));
+	return reinterpret_cast<trx_t*>(thd_get_ha_data(thd, innodb_hton_ptr));
 }
 
 #ifdef WITH_WSREP
@@ -4026,12 +4017,6 @@ static int innodb_init_params()
 	innodb_log_checksums = innodb_log_checksums_func_update(
 		NULL, innodb_log_checksums);
 
-#ifdef HAVE_LINUX_LARGE_PAGES
-	if ((os_use_large_pages = my_use_large_pages)) {
-		os_large_page_size = opt_large_page_size;
-	}
-#endif
-
 	row_rollback_on_timeout = (ibool) innobase_rollback_on_timeout;
 
 	srv_locks_unsafe_for_binlog = (ibool) innobase_locks_unsafe_for_binlog;
@@ -4052,7 +4037,7 @@ static int innodb_init_params()
 	if (innobase_open_files > open_files_limit) {
 		ib::warn() << "innodb_open_files " << innobase_open_files
 			   << " should not be greater"
-			   << "than the open_files_limit " << open_files_limit;
+			   << " than the open_files_limit " << open_files_limit;
 		if (innobase_open_files > tc_size) {
 			innobase_open_files = tc_size;
 		}
@@ -5824,12 +5809,12 @@ innobase_build_v_templ(
 	ut_ad(n_v_col > 0);
 
 	if (!locked) {
-		mutex_enter(&dict_sys->mutex);
+		mutex_enter(&dict_sys.mutex);
 	}
 
 	if (s_templ->vtempl) {
 		if (!locked) {
-			mutex_exit(&dict_sys->mutex);
+			mutex_exit(&dict_sys.mutex);
 		}
 		return;
 	}
@@ -5849,9 +5834,8 @@ innobase_build_v_templ(
 		const dict_v_col_t*	vcol = dict_table_get_nth_v_col(
 							ib_table, i);
 
-		for (ulint j = 0; j < vcol->num_base; j++) {
-			ulint	col_no = vcol->base_col[j]->ind;
-			marker[col_no] = true;
+		for (ulint j = vcol->num_base; j--; ) {
+			marker[vcol->base_col[j]->ind] = true;
 		}
 	}
 
@@ -5859,9 +5843,8 @@ innobase_build_v_templ(
 		for (ulint i = 0; i < add_v->n_v_col; i++) {
 			const dict_v_col_t*	vcol = &add_v->v_col[i];
 
-			for (ulint j = 0; j < vcol->num_base; j++) {
-				ulint	col_no = vcol->base_col[j]->ind;
-				marker[col_no] = true;
+			for (ulint j = vcol->num_base; j--; ) {
+				marker[vcol->base_col[j]->ind] = true;
 			}
 		}
 	}
@@ -5936,7 +5919,7 @@ innobase_build_v_templ(
 	}
 
 	if (!locked) {
-		mutex_exit(&dict_sys->mutex);
+		mutex_exit(&dict_sys.mutex);
 	}
 
 	s_templ->db_name = table->s->db.str;
@@ -6174,9 +6157,9 @@ no_such_table:
 			<< n_cols << " user"
 			" defined columns in InnoDB, but " << n_fields
 			<< " columns in MariaDB. Please check"
-			" INFORMATION_SCHEMA.INNODB_SYS_COLUMNS and " REFMAN
-			"innodb-troubleshooting.html for how to resolve the"
-			" issue.";
+			" INFORMATION_SCHEMA.INNODB_SYS_COLUMNS and"
+			" https://mariadb.com/kb/en/innodb-data-dictionary-troubleshooting/"
+			" for how to resolve the issue.";
 
 		/* Mark this table as corrupted, so the drop table
 		or force recovery can still use it, but not others. */
@@ -6253,7 +6236,7 @@ no_such_table:
 	key_used_on_scan = m_primary_key;
 
 	if (ib_table->n_v_cols) {
-		mutex_enter(&dict_sys->mutex);
+		mutex_enter(&dict_sys.mutex);
 		if (ib_table->vc_templ == NULL) {
 			ib_table->vc_templ = UT_NEW_NOKEY(dict_vcol_templ_t());
 		} else if (ib_table->get_ref_count() == 1) {
@@ -6269,7 +6252,7 @@ no_such_table:
 				true);
 		}
 
-		mutex_exit(&dict_sys->mutex);
+		mutex_exit(&dict_sys.mutex);
 	}
 
 	if (!check_index_consistency(table, ib_table)) {
@@ -7329,7 +7312,8 @@ build_template_needs_field(
 {
 	const Field*	field	= table->field[i];
 
-	if (!field->stored_in_db() && omits_virtual_cols(*table->s)) {
+	if (!field->stored_in_db()
+	    && ha_innobase::omits_virtual_cols(*table->s)) {
 		return NULL;
 	}
 
@@ -7486,7 +7470,7 @@ build_template_field(
 						&templ->rec_prefix_field_no);
 		}
 	} else {
-		ut_ad(!omits_virtual_cols(*table->s));
+		DBUG_ASSERT(!ha_innobase::omits_virtual_cols(*table->s));
 		col = &dict_table_get_nth_v_col(index->table, v_no)->m_col;
 		templ->clust_rec_field_no = v_no;
 		templ->rec_prefix_field_no = ULINT_UNDEFINED;
@@ -7876,7 +7860,8 @@ no_icp:
 					continue;
 				}
 			} else {
-				if (is_v && index->is_primary()) {
+				if (is_v
+				    && (skip_virtual || index->is_primary())) {
 					num_v++;
 					continue;
 				}
@@ -8364,7 +8349,7 @@ calc_row_difference(
 	trx_t* const	trx = prebuilt->trx;
 	doc_id_t	doc_id = FTS_NULL_DOC_ID;
 	ulint		num_v = 0;
-	const bool 	skip_virtual = omits_virtual_cols(*table->s);
+	const bool skip_virtual = ha_innobase::omits_virtual_cols(*table->s);
 
 	ut_ad(!srv_read_only_mode);
 
@@ -10277,7 +10262,7 @@ wsrep_append_foreign_key(
 		foreign->referenced_table : foreign->foreign_table)) {
 		WSREP_DEBUG("pulling %s table into cache",
 			    (referenced) ? "referenced" : "foreign");
-		mutex_enter(&(dict_sys->mutex));
+		mutex_enter(&dict_sys.mutex);
 
 		if (referenced) {
 			foreign->referenced_table =
@@ -10307,7 +10292,7 @@ wsrep_append_foreign_key(
 						TRUE, FALSE);
 			}
 		}
-		mutex_exit(&(dict_sys->mutex));
+		mutex_exit(&dict_sys.mutex);
 	}
 
 	if ( !((referenced) ?
@@ -10867,7 +10852,7 @@ innodb_base_col_setup_for_stored(
 	for (uint i= 0; i < field->table->s->fields; ++i) {
 		const Field* base_field = field->table->field[i];
 
-		if (!base_field->vcol_info
+		if (base_field->stored_in_db()
 		    && bitmap_is_set(&field->table->tmp_set, i)) {
 			ulint	z;
 			for (z = 0; z < table->n_cols; z++) {
@@ -10906,7 +10891,6 @@ create_table_info_t::create_table_def()
 	ulint		binary_type;
 	ulint		long_true_varchar;
 	ulint		charset_no;
-	ulint		j = 0;
 	ulint		doc_id_col = 0;
 	ibool		has_doc_id_col = FALSE;
 	mem_heap_t*	heap;
@@ -10942,7 +10926,7 @@ create_table_info_t::create_table_def()
 
 	/* Find out the number of virtual columns. */
 	ulint num_v = 0;
-	const bool omit_virtual = omits_virtual_cols(*m_form->s);
+	const bool omit_virtual = ha_innobase::omits_virtual_cols(*m_form->s);
 	const ulint n_cols = omit_virtual
 		? m_form->s->stored_fields : m_form->s->fields;
 
@@ -10988,7 +10972,7 @@ create_table_info_t::create_table_def()
 
 	heap = mem_heap_create(1000);
 
-	for (ulint i = 0; i < n_cols; i++) {
+	for (ulint i = 0, j = 0; j < n_cols; i++) {
 		Field*	field = m_form->field[i];
 		ulint vers_row = 0;
 
@@ -11109,10 +11093,16 @@ err_col:
 			dict_mem_table_add_s_col(
 				table, 0);
 		}
+
+		if (is_virtual && omit_virtual) {
+			continue;
+		}
+
+		j++;
 	}
 
 	if (num_v) {
-		for (ulint i = 0; i < n_cols; i++) {
+		for (ulint i = 0, j = 0; i < n_cols; i++) {
 			dict_v_col_t*	v_col;
 
 			const Field* field = m_form->field[i];
@@ -11130,7 +11120,7 @@ err_col:
 	}
 
 	/** Fill base columns for the stored column present in the list. */
-	if (table->s_cols && table->s_cols->size()) {
+	if (table->s_cols && !table->s_cols->empty()) {
 		for (ulint i = 0; i < n_cols; i++) {
 			Field*  field = m_form->field[i];
 
@@ -11161,7 +11151,7 @@ err_col:
 
 	if (table->is_temporary()) {
 		m_trx->table_id = table->id
-			= dict_sys->get_temporary_table_id();
+			= dict_sys.get_temporary_table_id();
 		ut_ad(dict_tf_get_rec_format(table->flags)
 		      != REC_FORMAT_COMPRESSED);
 		table->space_id = SRV_TMP_SPACE_ID;
@@ -12588,9 +12578,9 @@ create_table_info_t::create_table_update_dict()
 			DBUG_RETURN(-1);
 		}
 
-		mutex_enter(&dict_sys->mutex);
+		mutex_enter(&dict_sys.mutex);
 		fts_optimize_add_table(innobase_table);
-		mutex_exit(&dict_sys->mutex);
+		mutex_exit(&dict_sys.mutex);
 	}
 
 	if (const Field* ai = m_form->found_next_number_field) {
@@ -12859,12 +12849,12 @@ ha_innobase::discard_or_import_tablespace(
 	btr_cur_instant_init(). */
 	table_id_t id = m_prebuilt->table->id;
 	ut_ad(id);
-	mutex_enter(&dict_sys->mutex);
+	mutex_enter(&dict_sys.mutex);
 	dict_table_close(m_prebuilt->table, TRUE, FALSE);
-	dict_table_remove_from_cache(m_prebuilt->table);
+	dict_sys.remove(m_prebuilt->table);
 	m_prebuilt->table = dict_table_open_on_id(id, TRUE,
 						  DICT_TABLE_OP_NORMAL);
-	mutex_exit(&dict_sys->mutex);
+	mutex_exit(&dict_sys.mutex);
 	if (!m_prebuilt->table) {
 		err = DB_TABLE_NOT_FOUND;
 	} else {
@@ -12926,8 +12916,7 @@ inline int ha_innobase::delete_table(const char* name, enum_sql_command sqlcom)
 	extension, in contrast to ::create */
 	normalize_table_name(norm_name, name);
 
-	if (srv_read_only_mode
-	    || srv_force_recovery >= SRV_FORCE_NO_UNDO_LOG_SCAN) {
+	if (high_level_read_only) {
 		DBUG_RETURN(HA_ERR_TABLE_READONLY);
 	}
 
@@ -13015,10 +13004,8 @@ inline int ha_innobase::delete_table(const char* name, enum_sql_command sqlcom)
 		err = row_drop_database_for_mysql(norm_name, trx,
 			&num_partitions);
 		norm_name[len] = 0;
-		if (num_partitions == 0
-		    && !row_is_mysql_tmp_table_name(norm_name)) {
-			table_name_t tbl_name;
-			tbl_name.m_name = norm_name;
+		table_name_t tbl_name(norm_name);
+		if (num_partitions == 0 && !tbl_name.is_temporary()) {
 			ib::error() << "Table " << tbl_name <<
 				" does not exist in the InnoDB"
 				" internal data dictionary though MariaDB is"
@@ -13118,7 +13105,7 @@ innobase_drop_database(
 
 	DBUG_ASSERT(hton == innodb_hton_ptr);
 
-	if (srv_read_only_mode) {
+	if (high_level_read_only) {
 		return;
 	}
 
@@ -13873,7 +13860,7 @@ innodb_rec_per_key(
 		}
 
 		/* If the number of NULL values is the same as or
-		large than that of the distinct values, we could
+		larger than that of the distinct values, we could
 		consider that the table consists mostly of NULL value.
 		Set rec_per_key to 1. */
 		if (n_diff <= n_null) {
@@ -13997,7 +13984,7 @@ ha_innobase::info_low(
 				opt = DICT_STATS_RECALC_TRANSIENT;
 			}
 
-			ut_ad(!mutex_own(&dict_sys->mutex));
+			ut_ad(!mutex_own(&dict_sys.mutex));
 			ret = dict_stats_update(ib_table, opt);
 
 			if (ret != DB_SUCCESS) {
@@ -14451,7 +14438,7 @@ ha_innobase::optimize(
 			push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
 					    uint(err),
 				"InnoDB: Cannot defragment table %s: returned error code %d\n",
-				m_prebuilt->table->name, err);
+				m_prebuilt->table->name.m_name, err);
 
 			if(err == ER_SP_ALREADY_EXISTS) {
 				try_alter = false;
@@ -14851,6 +14838,10 @@ get_foreign_key_info(
 	LEX_CSTRING*		referenced_key_name;
 	LEX_CSTRING*		name = NULL;
 
+	if (dict_table_t::is_temporary_name(foreign->foreign_table_name)) {
+		return NULL;
+	}
+
 	ptr = dict_remove_db_name(foreign->id);
 	f_key_info.foreign_id = thd_make_lex_string(
 		thd, 0, ptr, strlen(ptr), 1);
@@ -14926,7 +14917,7 @@ get_foreign_key_info(
 
 		dict_table_t*	ref_table;
 
-		ut_ad(mutex_own(&dict_sys->mutex));
+		ut_ad(mutex_own(&dict_sys.mutex));
 		ref_table = dict_table_open_on_name(
 			foreign->referenced_table_name_lookup,
 			TRUE, FALSE, DICT_ERR_IGNORE_NONE);
@@ -14981,7 +14972,7 @@ ha_innobase::get_foreign_key_list(
 
 	m_prebuilt->trx->op_info = "getting list of foreign keys";
 
-	mutex_enter(&dict_sys->mutex);
+	mutex_enter(&dict_sys.mutex);
 
 	for (dict_foreign_set::iterator it
 		= m_prebuilt->table->foreign_set.begin();
@@ -14998,7 +14989,7 @@ ha_innobase::get_foreign_key_list(
 		}
 	}
 
-	mutex_exit(&dict_sys->mutex);
+	mutex_exit(&dict_sys.mutex);
 
 	m_prebuilt->trx->op_info = "";
 
@@ -15019,7 +15010,7 @@ ha_innobase::get_parent_foreign_key_list(
 
 	m_prebuilt->trx->op_info = "getting list of referencing foreign keys";
 
-	mutex_enter(&dict_sys->mutex);
+	mutex_enter(&dict_sys.mutex);
 
 	for (dict_foreign_set::iterator it
 		= m_prebuilt->table->referenced_set.begin();
@@ -15036,7 +15027,7 @@ ha_innobase::get_parent_foreign_key_list(
 		}
 	}
 
-	mutex_exit(&dict_sys->mutex);
+	mutex_exit(&dict_sys.mutex);
 
 	m_prebuilt->trx->op_info = "";
 
@@ -15115,20 +15106,21 @@ ha_innobase::get_cascade_foreign_key_table_list(
 {
 	m_prebuilt->trx->op_info = "getting cascading foreign keys";
 
-	std::list<table_list_item, ut_allocator<table_list_item> > table_list;
+	std::forward_list<table_list_item, ut_allocator<table_list_item> >
+		table_list;
 
 	typedef std::set<st_handler_tablename, tablename_compare,
 			 ut_allocator<st_handler_tablename> >	cascade_fk_set;
 
 	cascade_fk_set	fk_set;
 
-	mutex_enter(&dict_sys->mutex);
+	mutex_enter(&dict_sys.mutex);
 
 	/* Initialize the table_list with prebuilt->table name. */
 	struct table_list_item	item = {m_prebuilt->table,
 					m_prebuilt->table->name.m_name};
 
-	table_list.push_back(item);
+	table_list.push_front(item);
 
 	/* Get the parent table, grand parent table info from the
 	table list by depth-first traversal. */
@@ -15137,8 +15129,8 @@ ha_innobase::get_cascade_foreign_key_table_list(
 		dict_table_t*				parent = NULL;
 		std::pair<cascade_fk_set::iterator,bool>	ret;
 
-		item = table_list.back();
-		table_list.pop_back();
+		item = table_list.front();
+		table_list.pop_front();
 		parent_table = item.table;
 
 		if (parent_table == NULL) {
@@ -15185,13 +15177,13 @@ ha_innobase::get_cascade_foreign_key_table_list(
 					foreign->referenced_table,
 					foreign->referenced_table_name_lookup};
 
-				table_list.push_back(item1);
+				table_list.push_front(item1);
 
 				st_handler_tablename*	fk_table =
 					(st_handler_tablename*) thd_memdup(
 						thd, &f1, sizeof(*fk_table));
 
-				fk_table_list->push_back(fk_table);
+				fk_table_list->push_front(fk_table);
 			}
 		}
 
@@ -15201,7 +15193,7 @@ ha_innobase::get_cascade_foreign_key_table_list(
 
 	} while(!table_list.empty());
 
-	mutex_exit(&dict_sys->mutex);
+	mutex_exit(&dict_sys.mutex);
 
 	m_prebuilt->trx->op_info = "";
 
@@ -17353,86 +17345,36 @@ innodb_buffer_pool_size_update(THD*,st_mysql_sys_var*,void*, const void* save)
 		<< " (new size: " << in_val << " bytes)";
 }
 
-/*************************************************************//**
-Check whether valid argument given to "innodb_fts_internal_tbl_name"
-This function is registered as a callback with MySQL.
-@return 0 for valid stopword table */
-static
-int
-innodb_internal_table_validate(
-/*===========================*/
-	THD*, st_mysql_sys_var*,
-	void*				save,	/*!< out: immediate result
-						for update function */
-	struct st_mysql_value*		value)	/*!< in: incoming string */
+/** The latest assigned innodb_ft_aux_table name */
+static char* innodb_ft_aux_table;
+
+/** Update innodb_ft_aux_table_id on SET GLOBAL innodb_ft_aux_table.
+@param[out]	save	new value of innodb_ft_aux_table
+@param[in]	value	user-specified value */
+static int innodb_ft_aux_table_validate(THD*, st_mysql_sys_var*,
+					void* save, st_mysql_value* value)
 {
-	const char*	table_name;
-	char		buff[STRING_BUFFER_USUAL_SIZE];
-	int		len = sizeof(buff);
-	int		ret = 1;
-	dict_table_t*	user_table;
+	char buf[STRING_BUFFER_USUAL_SIZE];
+	int len = sizeof buf;
 
-	ut_a(save != NULL);
-	ut_a(value != NULL);
-
-	table_name = value->val_str(value, buff, &len);
-
-	if (!table_name) {
-		*static_cast<const char**>(save) = NULL;
-		return(0);
-	}
-
-	user_table = dict_table_open_on_name(
-		table_name, FALSE, TRUE, DICT_ERR_IGNORE_NONE);
-
-	if (user_table) {
-		if (dict_table_has_fts_index(user_table)) {
-			*static_cast<const char**>(save) = table_name;
-			ret = 0;
+	if (const char* table_name = value->val_str(value, buf, &len)) {
+		if (dict_table_t* table = dict_table_open_on_name(
+			    table_name, FALSE, TRUE, DICT_ERR_IGNORE_NONE)) {
+			const table_id_t id = dict_table_has_fts_index(table)
+				? table->id : 0;
+			dict_table_close(table, FALSE, FALSE);
+			if (id) {
+				innodb_ft_aux_table_id = id;
+				*static_cast<const char**>(save) = table_name;
+				return 0;
+			}
 		}
 
-		dict_table_close(user_table, FALSE, TRUE);
-
-		DBUG_EXECUTE_IF("innodb_evict_autoinc_table",
-			mutex_enter(&dict_sys->mutex);
-			dict_table_remove_from_cache(user_table, true);
-			mutex_exit(&dict_sys->mutex);
-		);
-	}
-
-	return(ret);
-}
-
-/****************************************************************//**
-Update global variable "fts_internal_tbl_name" with the "saved"
-stopword table name value. This function is registered as a callback
-with MySQL. */
-static
-void
-innodb_internal_table_update(
-/*=========================*/
-	THD*, st_mysql_sys_var*,
-	void*				var_ptr,/*!< out: where the
-						formal string goes */
-	const void*			save)	/*!< in: immediate result
-						from check function */
-{
-	const char*	table_name;
-	char*		old;
-
-	ut_a(save != NULL);
-	ut_a(var_ptr != NULL);
-
-	table_name = *static_cast<const char*const*>(save);
-	old = *(char**) var_ptr;
-	*(char**) var_ptr = table_name ? my_strdup(table_name, MYF(0)) : NULL;
-	my_free(old);
-
-	fts_internal_tbl_name2 = *(char**) var_ptr;
-	if (fts_internal_tbl_name2 == NULL) {
-		fts_internal_tbl_name = const_cast<char*>("default");
+		return 1;
 	} else {
-		fts_internal_tbl_name = fts_internal_tbl_name2;
+		*static_cast<char**>(save) = NULL;
+		innodb_ft_aux_table_id = 0;
+		return 0;
 	}
 }
 
@@ -17445,11 +17387,13 @@ void
 innodb_adaptive_hash_index_update(THD*, st_mysql_sys_var*, void*,
 				  const void* save)
 {
+	mysql_mutex_unlock(&LOCK_global_system_variables);
 	if (*(my_bool*) save) {
 		btr_search_enable();
 	} else {
 		btr_search_disable(true);
 	}
+	mysql_mutex_lock(&LOCK_global_system_variables);
 }
 #endif /* BTR_CUR_HASH_ADAPT */
 
@@ -17463,7 +17407,9 @@ innodb_cmp_per_index_update(THD*, st_mysql_sys_var*, void*, const void* save)
 	/* Reset the stats whenever we enable the table
 	INFORMATION_SCHEMA.innodb_cmp_per_index. */
 	if (!srv_cmp_per_index_enabled && *(my_bool*) save) {
+		mysql_mutex_unlock(&LOCK_global_system_variables);
 		page_zip_reset_stat_per_index();
+		mysql_mutex_lock(&LOCK_global_system_variables);
 	}
 
 	srv_cmp_per_index_enabled = !!(*(my_bool*) save);
@@ -17476,9 +17422,11 @@ static
 void
 innodb_old_blocks_pct_update(THD*, st_mysql_sys_var*, void*, const void* save)
 {
-	innobase_old_blocks_pct = static_cast<uint>(
-		buf_LRU_old_ratio_update(
-			*static_cast<const uint*>(save), TRUE));
+	mysql_mutex_unlock(&LOCK_global_system_variables);
+	uint ratio = buf_LRU_old_ratio_update(*static_cast<const uint*>(save),
+					      true);
+	mysql_mutex_lock(&LOCK_global_system_variables);
+	innobase_old_blocks_pct = ratio;
 }
 
 /****************************************************************//**
@@ -17489,9 +17437,10 @@ void
 innodb_change_buffer_max_size_update(THD*, st_mysql_sys_var*, void*,
 				     const void* save)
 {
-	srv_change_buffer_max_size =
-			(*static_cast<const uint*>(save));
+	srv_change_buffer_max_size = *static_cast<const uint*>(save);
+	mysql_mutex_unlock(&LOCK_global_system_variables);
 	ibuf_max_size_update(srv_change_buffer_max_size);
+	mysql_mutex_lock(&LOCK_global_system_variables);
 }
 
 #ifdef UNIV_DEBUG
@@ -17518,15 +17467,19 @@ innodb_make_page_dirty(THD*, st_mysql_sys_var*, void*, const void* save)
 {
 	mtr_t		mtr;
 	ulong		space_id = *static_cast<const ulong*>(save);
+	mysql_mutex_unlock(&LOCK_global_system_variables);
 	fil_space_t*	space = fil_space_acquire_silent(space_id);
 
 	if (space == NULL) {
+func_exit_no_space:
+		mysql_mutex_lock(&LOCK_global_system_variables);
 		return;
 	}
 
 	if (srv_saved_page_number_debug >= space->size) {
+func_exit:
 		space->release();
-		return;
+		goto func_exit_no_space;
 	}
 
 	mtr.start();
@@ -17547,7 +17500,7 @@ innodb_make_page_dirty(THD*, st_mysql_sys_var*, void*, const void* save)
 				 MLOG_2BYTES, &mtr);
 	}
 	mtr.commit();
-	space->release();
+	goto func_exit;
 }
 #endif // UNIV_DEBUG
 /*************************************************************//**
@@ -18083,8 +18036,11 @@ innodb_buffer_pool_evict_update(THD*, st_mysql_sys_var*, void*,
 {
 	if (const char* op = *static_cast<const char*const*>(save)) {
 		if (!strcmp(op, "uncompressed")) {
+			mysql_mutex_unlock(&LOCK_global_system_variables);
 			for (uint tries = 0; tries < 10000; tries++) {
 				if (innodb_buffer_pool_evict_uncompressed()) {
+					mysql_mutex_lock(
+						&LOCK_global_system_variables);
 					return;
 				}
 
@@ -18358,12 +18314,14 @@ void
 checkpoint_now_set(THD*, st_mysql_sys_var*, void*, const void* save)
 {
 	if (*(my_bool*) save) {
+		mysql_mutex_unlock(&LOCK_global_system_variables);
+
 		while (log_sys.last_checkpoint_lsn
 		       + SIZE_OF_MLOG_CHECKPOINT
 		       + (log_sys.append_on_checkpoint != NULL
 			  ? log_sys.append_on_checkpoint->size() : 0)
 		       < log_sys.lsn) {
-			log_make_checkpoint_at(LSN_MAX, TRUE);
+			log_make_checkpoint_at(LSN_MAX);
 			fil_flush_file_spaces(FIL_TYPE_LOG);
 		}
 
@@ -18372,6 +18330,8 @@ checkpoint_now_set(THD*, st_mysql_sys_var*, void*, const void* save)
 		if (err != DB_SUCCESS) {
 			ib::warn() << "Checkpoint set failed " << err;
 		}
+
+		mysql_mutex_lock(&LOCK_global_system_variables);
 	}
 }
 
@@ -18382,7 +18342,9 @@ void
 buf_flush_list_now_set(THD*, st_mysql_sys_var*, void*, const void* save)
 {
 	if (*(my_bool*) save) {
+		mysql_mutex_unlock(&LOCK_global_system_variables);
 		buf_flush_sync_all_buf_pools();
+		mysql_mutex_lock(&LOCK_global_system_variables);
 	}
 }
 
@@ -18461,7 +18423,9 @@ buffer_pool_dump_now(
 						check function */
 {
 	if (*(my_bool*) save && !srv_read_only_mode) {
+		mysql_mutex_unlock(&LOCK_global_system_variables);
 		buf_dump_start();
+		mysql_mutex_lock(&LOCK_global_system_variables);
 	}
 }
 
@@ -18484,7 +18448,9 @@ buffer_pool_load_now(
 						check function */
 {
 	if (*(my_bool*) save && !srv_read_only_mode) {
+		mysql_mutex_unlock(&LOCK_global_system_variables);
 		buf_load_start();
+		mysql_mutex_lock(&LOCK_global_system_variables);
 	}
 }
 
@@ -18507,7 +18473,9 @@ buffer_pool_load_abort(
 						check function */
 {
 	if (*(my_bool*) save && !srv_read_only_mode) {
+		mysql_mutex_unlock(&LOCK_global_system_variables);
 		buf_load_abort();
+		mysql_mutex_lock(&LOCK_global_system_variables);
 	}
 }
 
@@ -18558,55 +18526,63 @@ innodb_log_write_ahead_size_update(
 
 /** Update innodb_status_output or innodb_status_output_locks,
 which control InnoDB "status monitor" output to the error log.
-@param[out]	var_ptr	current value
+@param[out]	var	current value
 @param[in]	save	to-be-assigned value */
 static
 void
-innodb_status_output_update(THD*, st_mysql_sys_var*, void* var_ptr,
-			    const void* save)
+innodb_status_output_update(THD*,st_mysql_sys_var*,void*var,const void*save)
 {
-	*static_cast<my_bool*>(var_ptr) = *static_cast<const my_bool*>(save);
+	*static_cast<my_bool*>(var) = *static_cast<const my_bool*>(save);
+	mysql_mutex_unlock(&LOCK_global_system_variables);
 	/* Wakeup server monitor thread. */
 	os_event_set(srv_monitor_event);
+	mysql_mutex_lock(&LOCK_global_system_variables);
 }
 
-/******************************************************************
-Update the system variable innodb_encryption_threads */
+/** Update the system variable innodb_encryption_threads.
+@param[in]	save	to-be-assigned value */
 static
 void
-innodb_encryption_threads_update(THD*, st_mysql_sys_var*, void*,
-				 const void* save)
+innodb_encryption_threads_update(THD*,st_mysql_sys_var*,void*,const void*save)
 {
+	mysql_mutex_unlock(&LOCK_global_system_variables);
 	fil_crypt_set_thread_cnt(*static_cast<const uint*>(save));
+	mysql_mutex_lock(&LOCK_global_system_variables);
 }
 
-/******************************************************************
-Update the system variable innodb_encryption_rotate_key_age */
+/** Update the system variable innodb_encryption_rotate_key_age.
+@param[in]	save	to-be-assigned value */
 static
 void
 innodb_encryption_rotate_key_age_update(THD*, st_mysql_sys_var*, void*,
 					const void* save)
 {
+	mysql_mutex_unlock(&LOCK_global_system_variables);
 	fil_crypt_set_rotate_key_age(*static_cast<const uint*>(save));
+	mysql_mutex_lock(&LOCK_global_system_variables);
 }
 
-/******************************************************************
-Update the system variable innodb_encryption_rotation_iops */
+/** Update the system variable innodb_encryption_rotation_iops.
+@param[in]	save	to-be-assigned value */
 static
 void
 innodb_encryption_rotation_iops_update(THD*, st_mysql_sys_var*, void*,
 				       const void* save)
 {
+	mysql_mutex_unlock(&LOCK_global_system_variables);
 	fil_crypt_set_rotation_iops(*static_cast<const uint*>(save));
+	mysql_mutex_lock(&LOCK_global_system_variables);
 }
 
-/******************************************************************
-Update the system variable innodb_encrypt_tables*/
+/** Update the system variable innodb_encrypt_tables.
+@param[in]	save	to-be-assigned value */
 static
 void
 innodb_encrypt_tables_update(THD*, st_mysql_sys_var*, void*, const void* save)
 {
+	mysql_mutex_unlock(&LOCK_global_system_variables);
 	fil_crypt_set_encrypt_tables(*static_cast<const ulong*>(save));
+	mysql_mutex_lock(&LOCK_global_system_variables);
 }
 
 /** Update the innodb_log_checksums parameter.
@@ -19376,11 +19352,10 @@ static MYSQL_SYSVAR_BOOL(disable_sort_file_cache, srv_disable_sort_file_cache,
   "Whether to disable OS system file cache for sort I/O",
   NULL, NULL, FALSE);
 
-static MYSQL_SYSVAR_STR(ft_aux_table, fts_internal_tbl_name2,
-  PLUGIN_VAR_RQCMDARG,
+static MYSQL_SYSVAR_STR(ft_aux_table, innodb_ft_aux_table,
+  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
   "FTS internal auxiliary table to be checked",
-  innodb_internal_table_validate,
-  innodb_internal_table_update, NULL);
+  innodb_ft_aux_table_validate, NULL, NULL);
 
 static MYSQL_SYSVAR_ULONG(ft_cache_size, fts_max_cache_size,
   PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
@@ -19675,13 +19650,16 @@ void
 innobase_disallow_writes_update(THD*, st_mysql_sys_var*,
 				void* var_ptr, const void* save)
 {
-	*(my_bool*)var_ptr = *(my_bool*)save;
+	const my_bool val = *static_cast<const my_bool*>(save);
+	*static_cast<my_bool*>(var_ptr) = val;
 	ut_a(srv_allow_writes_event);
-	if (*(my_bool*)var_ptr) {
+	mysql_mutex_unlock(&LOCK_global_system_variables);
+	if (val) {
 		os_event_reset(srv_allow_writes_event);
 	} else {
 		os_event_set(srv_allow_writes_event);
 	}
+	mysql_mutex_lock(&LOCK_global_system_variables);
 }
 
 static MYSQL_SYSVAR_BOOL(disallow_writes, innobase_disallow_writes,
@@ -20473,10 +20451,10 @@ for purge thread */
 static TABLE* innodb_find_table_for_vc(THD* thd, dict_table_t* table)
 {
 	if (THDVAR(thd, background_thread)) {
-		/* Purge thread acquires dict_operation_lock while
-		processing undo log record. Release the dict_operation_lock
+		/* Purge thread acquires dict_sys.latch while
+		processing undo log record. Release it
 		before acquiring MDL on the table. */
-		rw_lock_s_unlock(dict_operation_lock);
+		rw_lock_s_unlock(&dict_sys.latch);
 		return innodb_acquire_mdl(thd, table);
 	} else {
 		if (table->vc_templ->mysql_table_query_id
@@ -20521,9 +20499,9 @@ TABLE* innobase_init_vc_templ(dict_table_t* table)
 		return NULL;
 	}
 
-	mutex_enter(&dict_sys->mutex);
+	mutex_enter(&dict_sys.mutex);
 	innobase_build_v_templ(mysql_table, table, table->vc_templ, NULL, true);
-	mutex_exit(&dict_sys->mutex);
+	mutex_exit(&dict_sys.mutex);
 	return mysql_table;
 }
 
@@ -20698,7 +20676,7 @@ void innobase_free_row_for_vcol(VCOL_STORAGE *storage)
 to store the value in passed in "my_rec" */
 dfield_t*
 innobase_get_computed_value(
-	const dtuple_t*		row,
+	dtuple_t*		row,
 	const dict_v_col_t*	col,
 	const dict_index_t*	index,
 	mem_heap_t**		local_heap,
@@ -20742,7 +20720,7 @@ innobase_get_computed_value(
 		buf = rec_buf2;
 	}
 
-	for (ulint i = 0; i < col->num_base; i++) {
+	for (ulint i = 0; i < unsigned{col->num_base}; i++) {
 		dict_col_t*			base_col = col->base_col[i];
 		const dfield_t*			row_field = NULL;
 		ulint				col_no = base_col->ind;
@@ -21028,11 +21006,11 @@ ib_errf(
 /* Keep the first 16 characters as-is, since the url is sometimes used
 as an offset from this.*/
 const char*	TROUBLESHOOTING_MSG =
-	"Please refer to " REFMAN "innodb-troubleshooting.html"
+	"Please refer to https://mariadb.com/kb/en/innodb-troubleshooting/"
 	" for how to resolve the issue.";
 
 const char*	TROUBLESHOOT_DATADICT_MSG =
-	"Please refer to " REFMAN "innodb-troubleshooting-datadict.html"
+	"Please refer to https://mariadb.com/kb/en/innodb-data-dictionary-troubleshooting/"
 	" for how to resolve the issue.";
 
 const char*	BUG_REPORT_MSG =
@@ -21042,9 +21020,6 @@ const char*	FORCE_RECOVERY_MSG =
 	"Please refer to "
 	"https://mariadb.com/kb/en/library/innodb-recovery-modes/"
 	" for information about forcing recovery.";
-
-const char*	ERROR_CREATING_MSG =
-	"Please refer to " REFMAN "error-creating-innodb.html";
 
 const char*	OPERATING_SYSTEM_ERROR_MSG =
 	"Some operating system error numbers are described at"
@@ -21329,16 +21304,6 @@ innodb_encrypt_tables_validate(
 		return 1;
 	}
 
-	if (!srv_fil_crypt_rotate_key_age) {
-		const char *msg = (encrypt_tables ? "enable" : "disable");
-		push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
-				    HA_ERR_UNSUPPORTED,
-				    "InnoDB: cannot %s encryption, "
-				    "innodb_encryption_rotate_key_age=0"
-				    " i.e. key rotation disabled", msg);
-		return 1;
-	}
-
 	return 0;
 }
 
@@ -21433,8 +21398,7 @@ ib_push_frm_error(
 			" Have you mixed up "
 			".frm files from different "
 			"installations? See "
-			REFMAN
-			"innodb-troubleshooting.html\n",
+			"https://mariadb.com/kb/en/innodb-troubleshooting/\n",
 			ib_table->name.m_name);
 
 		if (push_warning) {
@@ -21477,8 +21441,7 @@ ib_push_frm_error(
 			" Have you mixed up "
 			".frm files from different "
 			"installations? See "
-			REFMAN
-			"innodb-troubleshooting.html\n",
+			"https://mariadb.com/kb/en/innodb-troubleshooting/\n",
 			ib_table->name.m_name, n_keys,
 			table->s->keys);
 

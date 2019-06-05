@@ -1,5 +1,5 @@
 /* Copyright (c) 2000, 2017, Oracle and/or its affiliates.
-   Copyright (c) 2008, 2019, MariaDB Corporation.
+   Copyright (c) 2008, 2019, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -12,7 +12,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1335  USA */
 
 #define MYSQL_LEX 1
 #include "mariadb.h"
@@ -395,10 +395,6 @@ const LEX_CSTRING command_name[257]={
   { STRING_WITH_LEN("Error") }  // Last command number 255
 };
 
-const char *xa_state_names[]={
-  "NON-EXISTING", "ACTIVE", "IDLE", "PREPARED", "ROLLBACK ONLY"
-};
-
 #ifdef HAVE_REPLICATION
 /**
   Returns true if all tables should be ignored.
@@ -620,7 +616,8 @@ void init_update_queries(void)
                                             CF_CAN_GENERATE_ROW_EVENTS |
                                             CF_OPTIMIZER_TRACE |
                                             CF_CAN_BE_EXPLAINED |
-                                            CF_INSERTS_DATA | CF_SP_BULK_SAFE;
+                                            CF_INSERTS_DATA | CF_SP_BULK_SAFE |
+                                            CF_SP_BULK_OPTIMIZED;
   sql_command_flags[SQLCOM_REPLACE_SELECT]= CF_CHANGES_DATA | CF_REEXECUTION_FRAGILE |
                                             CF_CAN_GENERATE_ROW_EVENTS |
                                             CF_OPTIMIZER_TRACE |
@@ -1600,7 +1597,7 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
   if (WSREP(thd) && thd->wsrep_next_trx_id() == WSREP_UNDEFINED_TRX_ID)
   {
     thd->set_wsrep_next_trx_id(thd->query_id);
-    WSREP_DEBUG("assigned new next trx id: %lu", thd->wsrep_next_trx_id());
+    WSREP_DEBUG("assigned new next trx id: %" PRIu64, thd->wsrep_next_trx_id());
   }
 #endif /* WITH_WSREP */
 
@@ -2979,15 +2976,14 @@ static bool do_execute_sp(THD *thd, sp_head *sp)
       my_error(ER_SP_BADSELECT, MYF(0), ErrConvDQName(sp).ptr());
       return 1;
     }
-    /*
-      If SERVER_MORE_RESULTS_EXISTS is not set,
-      then remember that it should be cleared
-    */
-    bits_to_be_cleared= (~thd->server_status &
-                         SERVER_MORE_RESULTS_EXISTS);
-    thd->server_status|= SERVER_MORE_RESULTS_EXISTS;
   }
-
+  /*
+    If SERVER_MORE_RESULTS_EXISTS is not set,
+    then remember that it should be cleared
+  */
+  bits_to_be_cleared= (~thd->server_status &
+                       SERVER_MORE_RESULTS_EXISTS);
+  thd->server_status|= SERVER_MORE_RESULTS_EXISTS;
   ha_rows select_limit= thd->variables.select_limit;
   thd->variables.select_limit= HA_POS_ERROR;
 
@@ -3431,9 +3427,6 @@ mysql_execute_command(THD *thd)
         my_message(ER_SLAVE_IGNORED_TABLE, ER_THD(thd, ER_SLAVE_IGNORED_TABLE),
                    MYF(0));
       }
-      
-      for (table=all_tables; table; table=table->next_global)
-        table->updating= TRUE;
     }
     
     /*
@@ -3864,8 +3857,10 @@ mysql_execute_command(THD *thd)
     else
     {
       WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_SHOW);
+# ifdef ENABLED_PROFILING
       if (lex->sql_command == SQLCOM_SHOW_PROFILE)
         thd->profiling.discard_current_query();
+# endif
     }
 #endif /* WITH_WSREP */
 
@@ -4643,8 +4638,7 @@ end_with_restore_list:
                                   select_lex->order_list.elements,
                                   select_lex->order_list.first,
                                   unit->select_limit_cnt,
-                                  lex->duplicates, lex->ignore,
-                                  &found, &updated);
+                                  lex->ignore, &found, &updated);
     MYSQL_UPDATE_DONE(res, found, updated);
     /* mysql_update return 2 if we need to switch to multi-update */
     if (up_result != 2)
@@ -4665,6 +4659,16 @@ end_with_restore_list:
       res= 0;
 
     unit->set_limit(select_lex);
+    /*
+      We can not use mysql_explain_union() because of parameters of
+      mysql_select in mysql_multi_update so just set the option if needed
+    */
+    if (thd->lex->describe)
+    {
+      select_lex->set_explain_type(FALSE);
+      select_lex->options|= SELECT_DESCRIBE;
+    }
+
     res= mysql_multi_update_prepare(thd);
 
 #ifdef HAVE_REPLICATION
@@ -4874,6 +4878,13 @@ end_with_restore_list:
       */
       /* Skip first table, which is the table we are inserting in */
       TABLE_LIST *second_table= first_table->next_local;
+      /*
+        This is a hack: this leaves select_lex->table_list in an inconsistent
+        state as 'elements' does not contain number of elements in the list.
+        Moreover, if second_table == NULL then 'next' becomes invalid.
+        TODO: fix it by removing the front element (restoring of it should
+        be done properly as well)
+      */
       select_lex->table_list.first= second_table;
       select_lex->context.table_list= 
         select_lex->context.first_name_resolution_table= second_table;
@@ -6726,7 +6737,7 @@ static bool check_rename_table(THD *thd, TABLE_LIST *first_table,
                      0, 0))
       return 1;
 
-    /* check if these are refering to temporary tables */
+    /* check if these are referring to temporary tables */
     table->table= find_temporary_table_for_rename(thd, first_table, table);
     table->next_local->table= table->table;
 
@@ -7681,7 +7692,7 @@ void THD::reset_for_next_command(bool do_clear_error)
     use autoinc values passed in binlog events, not the values forced by
     the cluster.
   */
-  if (WSREP(this) && wsrep_thd_is_local(this) &&
+  if (WSREP_NNULL(this) && wsrep_thd_is_local(this) &&
       !slave_thread && wsrep_auto_increment_control)
   {
     variables.auto_increment_offset=
@@ -7790,7 +7801,6 @@ mysql_new_select(LEX *lex, bool move_down, SELECT_LEX *select_lex)
     if (select_lex->set_nest_level(old_nest_level + 1))
       DBUG_RETURN(1);
     SELECT_LEX_UNIT *unit;
-    lex->subqueries= TRUE;
     /* first select_lex of subselect or derived table */
     if (!(unit= lex->alloc_unit()))
       DBUG_RETURN(1);
@@ -8371,7 +8381,6 @@ TABLE_LIST *st_select_lex::add_table_to_list(THD *thd,
   ptr->derived=	    table->sel;
   if (!ptr->derived && is_infoschema_db(&ptr->db))
   {
-    ST_SCHEMA_TABLE *schema_table;
     if (ptr->updating &&
         /* Special cases which are processed by commands itself */
         lex->sql_command != SQLCOM_CHECK &&
@@ -8383,20 +8392,8 @@ TABLE_LIST *st_select_lex::add_table_to_list(THD *thd,
                INFORMATION_SCHEMA_NAME.str);
       DBUG_RETURN(0);
     }
+    ST_SCHEMA_TABLE *schema_table;
     schema_table= find_schema_table(thd, &ptr->table_name);
-    if (unlikely(!schema_table) ||
-        (schema_table->hidden && 
-         ((sql_command_flags[lex->sql_command] & CF_STATUS_COMMAND) == 0 || 
-          /*
-            this check is used for show columns|keys from I_S hidden table
-          */
-          lex->sql_command == SQLCOM_SHOW_FIELDS ||
-          lex->sql_command == SQLCOM_SHOW_KEYS)))
-    {
-      my_error(ER_UNKNOWN_TABLE, MYF(0),
-               ptr->table_name.str, INFORMATION_SCHEMA_NAME.str);
-      DBUG_RETURN(0);
-    }
     ptr->schema_table_name= ptr->table_name;
     ptr->schema_table= schema_table;
   }
@@ -8757,9 +8754,8 @@ bool st_select_lex::add_window_spec(THD *thd,
     query
 */
 
-void st_select_lex::set_lock_for_tables(thr_lock_type lock_type)
+void st_select_lex::set_lock_for_tables(thr_lock_type lock_type, bool for_update)
 {
-  bool for_update= lock_type >= TL_READ_NO_INSERT;
   DBUG_ENTER("set_lock_for_tables");
   DBUG_PRINT("enter", ("lock_type: %d  for_update: %d", lock_type,
 		       for_update));
@@ -10174,8 +10170,7 @@ bool parse_sql(THD *thd, Parser_state *parser_state,
     /* Start Digest */
     parser_state->m_digest_psi= MYSQL_DIGEST_START(thd->m_statement_psi);
 
-    if (parser_state->m_input.m_compute_digest ||
-       (parser_state->m_digest_psi != NULL))
+    if (parser_state->m_digest_psi != NULL)
     {
       /*
         If either:

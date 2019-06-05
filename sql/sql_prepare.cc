@@ -12,7 +12,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1335  USA */
 
 /**
   @file
@@ -3026,6 +3026,10 @@ void reinit_stmt_before_use(THD *thd, LEX *lex)
         for (order= win_spec->order_list->first; order; order= order->next)
           order->item= &order->item_ptr;
       }
+
+      // Reinit Pushdown
+      sl->cond_pushed_into_where= NULL;
+      sl->cond_pushed_into_having= NULL;
     }
     if (sl->changed_elements & TOUCHED_SEL_DERIVED)
     {
@@ -5289,6 +5293,7 @@ bool Protocol_local::store_longlong(longlong value, bool unsigned_flag)
 
 bool Protocol_local::store_decimal(const my_decimal *value)
 {
+  DBUG_ASSERT(0); // This method is not used yet
   StringBuffer<DECIMAL_MAX_STR_LENGTH> str;
   return value->to_string(&str) ? store_column(str.ptr(), str.length()) : true;
 }

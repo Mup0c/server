@@ -1,7 +1,7 @@
 #ifndef HANDLER_INCLUDED
 #define HANDLER_INCLUDED
 /*
-   Copyright (c) 2000, 2016, Oracle and/or its affiliates.
+   Copyright (c) 2000, 2019, Oracle and/or its affiliates.
    Copyright (c) 2009, 2019, MariaDB
 
    This program is free software; you can redistribute it and/or
@@ -16,7 +16,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335  USA
 */
 
 /* Definitions for parameters to do with handler-routines */
@@ -43,6 +43,7 @@
 #include <keycache.h>
 #include <mysql/psi/mysql_table.h>
 #include "sql_sequence.h"
+#include "mem_root_array.h"
 
 class Alter_info;
 class Virtual_column_info;
@@ -635,6 +636,8 @@ typedef ulonglong alter_table_operations;
 #define ALTER_RECREATE              (1ULL << 10)
 // Set for CONVERT TO
 #define ALTER_CONVERT_TO            (1ULL << 11)
+// Set for DROP ... ADD some_index
+#define ALTER_RENAME_INDEX          (1ULL << 12)
 // Set for ADD FOREIGN KEY
 #define ALTER_ADD_FOREIGN_KEY       (1ULL << 21)
 // Set for DROP FOREIGN KEY
@@ -888,15 +891,6 @@ struct xid_t {
   }
 };
 typedef struct xid_t XID;
-
-/*
-  The size of XID string representation in the form
-  'gtrid', 'bqual', formatID
-  see xid_t::get_sql_string() for details.
-*/
-#define SQL_XIDSIZE (XIDDATASIZE * 2 + 8 + MY_INT64_NUM_DECIMAL_DIGITS)
-/* The 'buf' has to have space for at least SQL_XIDSIZE bytes. */
-uint get_sql_xid(XID *xid, char *buf);
 
 /* for recover() handlerton call */
 #define MIN_XID_LIST_SIZE  128
@@ -2014,13 +2008,11 @@ struct Vers_parse_info: public Table_period_info
 {
   Vers_parse_info() :
     Table_period_info(STRING_WITH_LEN("SYSTEM_TIME")),
-    check_unit(VERS_UNDEFINED),
     versioned_fields(false),
     unversioned_fields(false)
   {}
 
   Table_period_info::start_end_t as_row;
-  vers_sys_type_t check_unit;
 
 protected:
   friend struct Table_scope_and_contents_source_st;
@@ -2055,8 +2047,8 @@ public:
   bool fix_create_like(Alter_info &alter_info, HA_CREATE_INFO &create_info,
                        TABLE_LIST &src_table, TABLE_LIST &table);
   bool check_sys_fields(const Lex_table_name &table_name,
-                        const Lex_table_name &db,
-                        Alter_info *alter_info, bool native);
+                        const Lex_table_name &db, Alter_info *alter_info,
+                        bool can_native) const;
 
   /**
      At least one field was specified 'WITH/WITHOUT SYSTEM VERSIONING'.
@@ -2139,8 +2131,6 @@ struct Table_scope_and_contents_source_pod_st // For trivial members
   MDL_ticket *mdl_ticket;
   bool table_was_deleted;
   sequence_definition *seq_create_info;
-
-  bool vers_native(THD *thd) const;
 
   void init()
   {
@@ -2292,6 +2282,7 @@ public:
   inplace_alter_handler_ctx() {}
 
   virtual ~inplace_alter_handler_ctx() {}
+  virtual void set_shared_data(const inplace_alter_handler_ctx& ctx) {}
 };
 
 
@@ -2370,6 +2361,29 @@ public:
   uint *index_add_buffer;
 
   /**
+     Old and new index names. Used for index rename.
+  */
+  struct Rename_key_pair
+  {
+    Rename_key_pair(const KEY *old_key, const KEY *new_key)
+        : old_key(old_key), new_key(new_key)
+    {
+    }
+    const KEY *old_key;
+    const KEY *new_key;
+  };
+  /**
+     Vector of key pairs from DROP/ADD index which can be renamed.
+  */
+  typedef Mem_root_array<Rename_key_pair, true> Rename_keys_vector;
+
+  /**
+     A list of indexes which should be renamed.
+     Index definitions stays the same.
+  */
+  Rename_keys_vector rename_keys;
+
+  /**
      Context information to allow handlers to keep context between in-place
      alter API calls.
 
@@ -2430,23 +2444,7 @@ public:
                      Alter_info *alter_info_arg,
                      KEY *key_info_arg, uint key_count_arg,
                      partition_info *modified_part_info_arg,
-                     bool ignore_arg)
-    : create_info(create_info_arg),
-    alter_info(alter_info_arg),
-    key_info_buffer(key_info_arg),
-    key_count(key_count_arg),
-    index_drop_count(0),
-    index_drop_buffer(NULL),
-    index_add_count(0),
-    index_add_buffer(NULL),
-    handler_ctx(NULL),
-    group_commit_ctx(NULL),
-    handler_flags(0),
-    modified_part_info(modified_part_info_arg),
-    ignore(ignore_arg),
-    online(false),
-    unsupported_reason(NULL)
-  {}
+                     bool ignore_arg);
 
   ~Alter_inplace_info()
   {
@@ -2882,6 +2880,7 @@ public:
   time_t check_time;
   time_t update_time;
   uint block_size;			/* index block size */
+  ha_checksum checksum;
 
   /*
     number of buffer bytes that native mrr implementation needs,
@@ -3576,6 +3575,10 @@ public:
             ha_pre_index_end() :
             pre_inited == RND ? ha_pre_rnd_end() : 0 );
   }
+  virtual bool vers_can_native(THD *thd)
+  {
+    return ht->flags & HTON_NATIVE_SYS_VERSIONING;
+  }
 
   /**
      @brief
@@ -3922,7 +3925,7 @@ public:
   virtual uint max_supported_key_part_length() const { return 255; }
   virtual uint min_record_length(uint options) const { return 1; }
 
-  virtual uint checksum() const { return 0; }
+  virtual int calculate_checksum();
   virtual bool is_crashed() const  { return 0; }
   virtual bool auto_repair(int error) const { return 0; }
 
@@ -4496,6 +4499,12 @@ protected:
 public:
   bool check_table_binlog_row_based(bool binlog_row);
 
+  inline void clear_cached_table_binlog_row_based_flag()
+  {
+    check_table_binlog_row_based_done= 0;
+    check_table_binlog_row_based_result= 0;
+  }
+private:
   /* Cache result to avoid extra calls */
   inline void mark_trx_read_write()
   {
@@ -4741,7 +4750,6 @@ public:
   virtual int enable_indexes(uint mode) { return HA_ERR_WRONG_COMMAND; }
   virtual int discard_or_import_tablespace(my_bool discard)
   { return (my_errno=HA_ERR_WRONG_COMMAND); }
-  virtual void prepare_for_alter() { return; }
   virtual void drop_table(const char *name);
   virtual int create(const char *name, TABLE *form, HA_CREATE_INFO *info)=0;
 
@@ -4966,7 +4974,6 @@ void trans_register_ha(THD *thd, bool all, handlerton *ht);
 
 const char *get_canonical_filename(handler *file, const char *path,
                                    char *tmp_path);
-bool mysql_xa_recover(THD *thd);
 void commit_checkpoint_notify_ha(handlerton *hton, void *cookie);
 
 inline const LEX_CSTRING *table_case_name(HA_CREATE_INFO *info, const LEX_CSTRING *name)

@@ -21,7 +21,7 @@ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
-51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -423,8 +423,12 @@ unreadable:
 	}
 
 	btr_cur_t cur;
+	/* Relax the assertion in rec_init_offsets(). */
+	ut_ad(!index->in_instant_init);
+	ut_d(index->in_instant_init = true);
 	dberr_t err = btr_cur_open_at_index_side(true, index, BTR_SEARCH_LEAF,
 						 &cur, 0, mtr);
+	ut_d(index->in_instant_init = false);
 	if (err != DB_SUCCESS) {
 		index->table->corrupted = true;
 		return err;
@@ -626,7 +630,11 @@ index root page.
 @return	whether the page is corrupted */
 bool btr_cur_instant_root_init(dict_index_t* index, const page_t* page)
 {
-	ut_ad(page_is_root(page));
+	ut_ad(!index->is_dummy);
+	ut_ad(fil_page_index_page_check(page));
+	ut_ad(!page_has_siblings(page));
+	ut_ad(page_get_space_id(page) == index->table->space_id);
+	ut_ad(page_get_page_no(page) == index->page);
 	ut_ad(!page_is_comp(page) == !dict_table_is_comp(index->table));
 	ut_ad(index->is_primary());
 	ut_ad(!index->is_instant());
@@ -1552,7 +1560,7 @@ retry_page_get:
 				"Table %s is encrypted but encryption service or"
 				" used key_id is not available. "
 				" Can't continue reading table.",
-				index->table->name);
+				index->table->name.m_name);
 			index->table->file_unreadable = true;
 		}
 
@@ -1665,7 +1673,7 @@ retry_page_get:
 						"Table %s is encrypted but encryption service or"
 						" used key_id is not available. "
 						" Can't continue reading table.",
-						index->table->name);
+						index->table->name.m_name);
 					index->table->file_unreadable = true;
 				}
 
@@ -1694,7 +1702,7 @@ retry_page_get:
 					"Table %s is encrypted but encryption service or"
 					" used key_id is not available. "
 					" Can't continue reading table.",
-					index->table->name);
+					index->table->name.m_name);
 				index->table->file_unreadable = true;
 			}
 
@@ -2601,7 +2609,7 @@ btr_cur_open_at_index_side_func(
 					"Table %s is encrypted but encryption service or"
 					" used key_id is not available. "
 					" Can't continue reading table.",
-					index->table->name);
+					index->table->name.m_name);
 				index->table->file_unreadable = true;
 			}
 
@@ -2960,7 +2968,7 @@ btr_cur_open_at_rnd_pos_func(
 					"Table %s is encrypted but encryption service or"
 					" used key_id is not available. "
 					" Can't continue reading table.",
-					index->table->name);
+					index->table->name.m_name);
 				index->table->file_unreadable = true;
 			}
 
@@ -4866,10 +4874,7 @@ btr_cur_pessimistic_update(
 	}
 
 	rec = btr_cur_get_rec(cursor);
-
-	*offsets = rec_get_offsets(
-		rec, index, *offsets, page_is_leaf(page),
-		ULINT_UNDEFINED, offsets_heap);
+	ut_ad(rec_offs_validate(rec, index, *offsets));
 
 	dtuple_t* new_entry;
 
@@ -5670,14 +5675,14 @@ btr_cur_optimistic_delete_func(
 	ut_ad(flags == 0 || flags == BTR_CREATE_FLAG);
 	ut_ad(mtr_memo_contains(mtr, btr_cur_get_block(cursor),
 				MTR_MEMO_PAGE_X_FIX));
-	ut_ad(mtr_memo_contains(mtr, btr_cur_get_block(cursor),
-			       MTR_MEMO_PAGE_X_FIX));
 	ut_ad(mtr->is_named_space(cursor->index->table->space));
+	ut_ad(!cursor->index->is_dummy);
 
 	/* This is intended only for leaf page deletions */
 
 	block = btr_cur_get_block(cursor);
 
+	ut_ad(block->page.id.space() == cursor->index->table->space->id);
 	ut_ad(page_is_leaf(buf_block_get_frame(block)));
 	ut_ad(!dict_index_is_online_ddl(cursor->index)
 	      || dict_index_is_clust(cursor->index)
@@ -5685,7 +5690,7 @@ btr_cur_optimistic_delete_func(
 
 	rec = btr_cur_get_rec(cursor);
 
-	if (UNIV_UNLIKELY(page_is_root(block->frame)
+	if (UNIV_UNLIKELY(block->page.id.page_no() == cursor->index->page
 			  && page_get_n_recs(block->frame) == 1
 			  + (cursor->index->is_instant()
 			     && !rec_is_metadata(rec, *cursor->index)))) {
@@ -5863,6 +5868,8 @@ btr_cur_pessimistic_delete(
 					| MTR_MEMO_SX_LOCK));
 	ut_ad(mtr_memo_contains(mtr, block, MTR_MEMO_PAGE_X_FIX));
 	ut_ad(mtr->is_named_space(index->table->space));
+	ut_ad(!index->is_dummy);
+	ut_ad(block->page.id.space() == index->table->space->id);
 
 	if (!has_reserved_extents) {
 		/* First reserve enough free space for the file segments
@@ -5916,7 +5923,7 @@ btr_cur_pessimistic_delete(
 			lock_update_delete(block, rec);
 		}
 
-		if (!page_is_root(page)) {
+		if (block->page.id.page_no() != index->page) {
 			if (page_get_n_recs(page) < 2) {
 				goto discard_page;
 			}
@@ -6030,10 +6037,11 @@ discard_page:
 			on a page, we have to change the parent node pointer
 			so that it is equal to the new leftmost node pointer
 			on the page */
-
-			btr_node_ptr_delete(index, block, mtr);
+			btr_cur_t cursor;
+			btr_page_get_father(index, block, mtr, &cursor);
+			btr_cur_node_ptr_delete(&cursor, mtr);
 			const ulint	level = btr_page_get_level(page);
-
+			// FIXME: reuse the node_ptr from above
 			dtuple_t*	node_ptr = dict_index_build_node_ptr(
 				index, next_rec, block->page.id.page_no(),
 				heap, level);
@@ -6097,6 +6105,23 @@ return_after_reservations:
 
 	index->table->space->release_free_extents(n_reserved);
 	return(ret);
+}
+
+/** Delete the node pointer in a parent page.
+@param[in,out]	parent	cursor pointing to parent record
+@param[in,out]	mtr	mini-transaction */
+void btr_cur_node_ptr_delete(btr_cur_t* parent, mtr_t* mtr)
+{
+	ut_ad(mtr_memo_contains(mtr, btr_cur_get_block(parent),
+				MTR_MEMO_PAGE_X_FIX));
+	dberr_t err;
+	ibool compressed = btr_cur_pessimistic_delete(&err, TRUE, parent,
+						      BTR_CREATE_FLAG, false,
+						      mtr);
+	ut_a(err == DB_SUCCESS);
+	if (!compressed) {
+		btr_cur_compress_if_useful(parent, FALSE, mtr);
+	}
 }
 
 /*******************************************************************//**
@@ -6235,7 +6260,7 @@ btr_estimate_n_rows_in_range_on_level(
 					"Table %s is encrypted but encryption service or"
 					" used key_id is not available. "
 					" Can't continue reading table.",
-					index->table->name);
+					index->table->name.m_name);
 				index->table->file_unreadable = true;
 			}
 
@@ -8120,8 +8145,7 @@ btr_free_externally_stored_field(
 			}
 			next_page_no = mach_read_from_4(page + FIL_PAGE_NEXT);
 
-			btr_page_free_low(index, ext_block, 0,
-				true, &mtr);
+			btr_page_free(index, ext_block, &mtr, true);
 
 			if (page_zip != NULL) {
 				mach_write_to_4(field_ref + BTR_EXTERN_PAGE_NO,
@@ -8147,12 +8171,7 @@ btr_free_externally_stored_field(
 			next_page_no = mach_read_from_4(
 				page + FIL_PAGE_DATA
 				+ BTR_BLOB_HDR_NEXT_PAGE_NO);
-
-			/* We must supply the page level (= 0) as an argument
-			because we did not store it on the page (we save the
-			space overhead from an index page header. */
-			btr_page_free_low(index, ext_block, 0,
-				true, &mtr);
+			btr_page_free(index, ext_block, &mtr, true);
 
 			mlog_write_ulint(field_ref + BTR_EXTERN_PAGE_NO,
 					 next_page_no,

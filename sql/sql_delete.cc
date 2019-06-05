@@ -13,7 +13,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335  USA */
 
 /*
   Delete of records tables.
@@ -298,12 +298,7 @@ int TABLE::delete_row()
 
   store_record(this, record[1]);
   vers_update_end();
-  int res;
-  if ((res= file->extra(HA_EXTRA_REMEMBER_POS)))
-    return res;
-  if ((res= file->ha_update_row(record[1], record[0])))
-    return res;
-  return file->extra(HA_EXTRA_RESTORE_POS);
+  return file->ha_update_row(record[1], record[0]);
 }
 
 
@@ -379,18 +374,6 @@ bool mysql_delete(THD *thd, TABLE_LIST *table_list, COND *conds,
       conds= table_list->on_expr;
       table_list->on_expr= NULL;
     }
-  }
-  if (table_list->has_period())
-  {
-    if (table_list->is_view_or_derived())
-    {
-      my_error(ER_IT_IS_A_VIEW, MYF(0), table_list->table_name.str);
-      DBUG_RETURN(true);
-    }
-
-    conds= select_lex->period_setup_conds(thd, table_list, conds);
-    if (!conds)
-      DBUG_RETURN(true);
   }
 
   if (thd->lex->handle_list_of_derived(table_list, DT_MERGE_FOR_INSERT))
@@ -730,9 +713,14 @@ bool mysql_delete(THD *thd, TABLE_LIST *table_list, COND *conds,
     goto got_error;
 
   if (table_list->has_period())
+  {
     table->use_all_columns();
+    table->rpl_write_set= table->write_set;
+  }
   else
+  {
     table->mark_columns_needed_for_delete();
+  }
 
   if ((table->file->ha_table_flags() & HA_CAN_FORCE_BULK_DELETE) &&
       !table->prepare_triggers_for_delete_stmt_or_event())
@@ -1055,6 +1043,20 @@ int mysql_prepare_delete(THD *thd, TABLE_LIST *table_list,
     if (select_lex->vers_setup_conds(thd, table_list))
       DBUG_RETURN(true);
   }
+
+  if (table_list->has_period())
+  {
+    if (table_list->is_view_or_derived())
+    {
+      my_error(ER_IT_IS_A_VIEW, MYF(0), table_list->table_name.str);
+      DBUG_RETURN(true);
+    }
+
+    *conds= select_lex->period_setup_conds(thd, table_list, *conds);
+    if (!*conds)
+      DBUG_RETURN(true);
+  }
+
   if ((wild_num && setup_wild(thd, table_list, field_list, NULL, wild_num,
                               &select_lex->hidden_bit_fields)) ||
       setup_fields(thd, Ref_ptr_array(),

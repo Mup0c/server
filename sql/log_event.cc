@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2018, Oracle and/or its affiliates.
+   Copyright (c) 2000, 2019, Oracle and/or its affiliates.
    Copyright (c) 2009, 2019, MariaDB
 
    This program is free software; you can redistribute it and/or modify
@@ -13,7 +13,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335  USA */
 
 
 #include "mariadb.h"
@@ -39,6 +39,7 @@
 #include "transaction.h"
 #include <my_dir.h>
 #include "sql_show.h"    // append_identifier
+#include "debug_sync.h"  // debug_sync
 #include <mysql/psi/mysql_statement.h>
 #include <strfunc.h>
 #include "compat56.h"
@@ -1627,8 +1628,11 @@ int Log_event_writer::encrypt_and_write(const uchar *pos, size_t len)
       return 1;
 
     uint dstlen;
-    if (encryption_ctx_update(ctx, pos, (uint)len, dst, &dstlen))
+    if (len == 0)
+      dstlen= 0;
+    else if (encryption_ctx_update(ctx, pos, (uint)len, dst, &dstlen))
       goto err;
+
     if (maybe_write_event_len(dst, dstlen))
       return 1;
     pos= dst;
@@ -1846,8 +1850,16 @@ int Log_event::read_log_event(IO_CACHE* file, String* packet,
   {
     uchar iv[BINLOG_IV_LENGTH];
     fdle->crypto_data.set_iv(iv, (uint32) (my_b_tell(file) - data_len));
-
-    char *newpkt= (char*)my_malloc(data_len + ev_offset + 1, MYF(MY_WME));
+    size_t sz= data_len + ev_offset + 1;
+#ifdef HAVE_WOLFSSL
+    /*
+      Workaround for MDEV-19582.
+      WolfSSL reads memory out of bounds with decryption/NOPAD)
+      We allocate a little more memory therefore.
+    */
+    sz += MY_AES_BLOCK_SIZE;
+#endif
+    char *newpkt= (char*)my_malloc(sz, MYF(MY_WME));
     if (!newpkt)
       DBUG_RETURN(LOG_READ_MEM);
     memcpy(newpkt, packet->ptr(), ev_offset);
@@ -7945,6 +7957,7 @@ Gtid_log_event::Gtid_log_event(THD *thd_arg, uint64 seq_no_arg,
     flags2((standalone ? FL_STANDALONE : 0) | (commit_id_arg ? FL_GROUP_COMMIT_ID : 0))
 {
   cache_type= Log_event::EVENT_NO_CACHE;
+  bool is_tmp_table= thd_arg->lex->stmt_accessed_temp_table();
   if (thd_arg->transaction.stmt.trans_did_wait() ||
       thd_arg->transaction.all.trans_did_wait())
     flags2|= FL_WAITED;
@@ -7953,7 +7966,7 @@ Gtid_log_event::Gtid_log_event(THD *thd_arg, uint64 seq_no_arg,
       thd_arg->transaction.all.trans_did_ddl() ||
       thd_arg->transaction.all.has_created_dropped_temp_table())
     flags2|= FL_DDL;
-  else if (is_transactional)
+  else if (is_transactional && !is_tmp_table)
     flags2|= FL_TRANSACTIONAL;
   if (!(thd_arg->variables.option_bits & OPTION_RPL_SKIP_PARALLEL))
     flags2|= FL_ALLOW_PARALLEL;
@@ -11297,6 +11310,12 @@ int Rows_log_event::do_apply_event(rpl_group_info *rgi)
     /* A small test to verify that objects have consistent types */
     DBUG_ASSERT(sizeof(thd->variables.option_bits) == sizeof(OPTION_RELAXED_UNIQUE_CHECKS));
 
+    DBUG_EXECUTE_IF("rows_log_event_before_open_table",
+                    {
+                      const char action[] = "now SIGNAL before_open_table WAIT_FOR go_ahead_sql";
+                      DBUG_ASSERT(!debug_sync_set_action(thd, STRING_WITH_LEN(action)));
+                    };);
+
     if (slave_run_triggers_for_rbr)
     {
       LEX *lex= thd->lex;
@@ -11321,7 +11340,6 @@ int Rows_log_event::do_apply_event(rpl_group_info *rgi)
     }
     if (unlikely(open_and_lock_tables(thd, rgi->tables_to_lock, FALSE, 0)))
     {
-      uint actual_error= thd->get_stmt_da()->sql_errno();
 #ifdef WITH_WSREP
       if (WSREP(thd))
       {
@@ -11334,23 +11352,22 @@ int Rows_log_event::do_apply_event(rpl_group_info *rgi)
                     (long long) wsrep_thd_trx_seqno(thd));
       }
 #endif /* WITH_WSREP */
-      if ((thd->is_slave_error || thd->is_fatal_error) &&
-          !is_parallel_retry_error(rgi, actual_error))
+      if (thd->is_error() &&
+          !is_parallel_retry_error(rgi, error= thd->get_stmt_da()->sql_errno()))
       {
         /*
           Error reporting borrowed from Query_log_event with many excessive
-          simplifications. 
+          simplifications.
           We should not honour --slave-skip-errors at this point as we are
-          having severe errors which should not be skiped.
+          having severe errors which should not be skipped.
         */
-        rli->report(ERROR_LEVEL, actual_error, rgi->gtid_info(),
+        rli->report(ERROR_LEVEL, error, rgi->gtid_info(),
                     "Error executing row event: '%s'",
-                    (actual_error ? thd->get_stmt_da()->message() :
+                    (error ? thd->get_stmt_da()->message() :
                      "unexpected success or fatal error"));
         thd->is_slave_error= 1;
       }
       /* remove trigger's tables */
-      error= actual_error;
       goto err;
     }
 
@@ -13502,6 +13519,12 @@ Rows_log_event::write_row(rpl_group_info *rgi,
     if (table->file->ha_table_flags() & HA_DUPLICATE_POS)
     {
       DBUG_PRINT("info",("Locating offending record using rnd_pos()"));
+
+      if ((error= table->file->ha_rnd_init_with_error(0)))
+      {
+        DBUG_RETURN(error);
+      }
+
       error= table->file->ha_rnd_pos(table->record[1], table->file->dup_ref);
       if (unlikely(error))
       {
@@ -13509,6 +13532,7 @@ Rows_log_event::write_row(rpl_group_info *rgi,
         table->file->print_error(error, MYF(0));
         DBUG_RETURN(error);
       }
+      table->file->ha_rnd_end();
     }
     else
     {

@@ -13,7 +13,7 @@ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
-51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -663,11 +663,11 @@ PageBulk::latch()
 	/* In case the block is S-latched by page_cleaner. */
 	if (!buf_page_optimistic_get(RW_X_LATCH, m_block, m_modify_clock,
 				     __FILE__, __LINE__, &m_mtr)) {
-		m_block = buf_page_get_gen(
-			page_id_t(m_index->table->space_id, m_page_no),
-			m_index->table->space->zip_size(),
-			RW_X_LATCH, m_block, BUF_GET_IF_IN_POOL,
-			__FILE__, __LINE__, &m_mtr, &m_err);
+		m_block = buf_page_get_gen(page_id_t(m_index->table->space_id,
+						     m_page_no),
+					   0, RW_X_LATCH,
+					   m_block, BUF_GET_IF_IN_POOL,
+					   __FILE__, __LINE__, &m_mtr, &m_err);
 
 		if (m_err != DB_SUCCESS) {
 			return (m_err);
@@ -1033,7 +1033,7 @@ BtrBulk::finish(dberr_t	err)
 		root_page_bulk.copyIn(first_rec);
 
 		/* Remove last page. */
-		btr_page_free_low(m_index, last_block, m_root_level, false, &mtr);
+		btr_page_free(m_index, last_block, &mtr);
 
 		/* Do not flush the last page. */
 		last_block->page.flush_observer = NULL;
@@ -1046,6 +1046,7 @@ BtrBulk::finish(dberr_t	err)
 
 	ut_ad(!sync_check_iterate(dict_sync_check()));
 
-	ut_ad(err != DB_SUCCESS || btr_validate_index(m_index, NULL));
+	ut_ad(err != DB_SUCCESS
+	      || btr_validate_index(m_index, NULL) == DB_SUCCESS);
 	return(err);
 }

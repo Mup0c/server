@@ -1,5 +1,5 @@
 /* Copyright (c) 2000, 2015, Oracle and/or its affiliates.
-   Copyright (c) 2010, 2018, MariaDB Corporation
+   Copyright (c) 2010, 2019, MariaDB Corporation.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -12,7 +12,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335  USA */
 
 /**
   @defgroup Semantic_Analysis Semantic Analysis
@@ -322,15 +322,6 @@ extern uint binlog_unsafe_map[256];
 */
 void binlog_unsafe_map_init();
 #endif
-
-struct LEX_TYPE
-{
-  enum enum_field_types type;
-  char *length, *dec;
-  CHARSET_INFO *charset;
-  void set(int t, char *l, char *d, CHARSET_INFO *cs)
-  { type= (enum_field_types)t; length= l; dec= d; charset= cs; }
-};
 
 #ifdef MYSQL_SERVER
 /*
@@ -808,12 +799,6 @@ public:
   friend bool mysql_new_select(LEX *lex, bool move_down, SELECT_LEX *sel);
   friend bool mysql_make_view(THD *thd, TABLE_SHARE *share, TABLE_LIST *table,
                               bool open_view_no_parse);
-  friend bool mysql_derived_prepare(THD *thd, LEX *lex,
-                                  TABLE_LIST *orig_table_list);
-  friend bool mysql_derived_merge(THD *thd, LEX *lex,
-                                  TABLE_LIST *orig_table_list);
-  friend bool TABLE_LIST::init_derived(THD *thd, bool init_view);
-
   friend class st_select_lex;
 private:
   void fast_exclude();
@@ -887,6 +872,12 @@ public:
     table for it
   */
   Item_int *intersect_mark;
+  /**
+     TRUE if the unit contained TVC at the top level that has been wrapped
+     into SELECT:
+     VALUES (v1) ... (vn) => SELECT * FROM (VALUES (v1) ... (vn)) as tvc
+  */
+  bool with_wrapped_tvc;
   /**
     Pointer to 'last' select, or pointer to select where we stored
     global parameters for union.
@@ -983,6 +974,7 @@ public:
   bool union_needs_tmp_table();
 
   void set_unique_exclude();
+  bool check_distinct_in_union();
 
   friend struct LEX;
   friend int subselect_union_engine::exec();
@@ -1180,6 +1172,7 @@ public:
   */
   uint hidden_bit_fields;
   enum_parsing_place parsing_place; /* where we are parsing expression */
+  enum_parsing_place save_parsing_place;
   enum_parsing_place context_analysis_place; /* where we are in prepare */
   bool with_sum_func;   /* sum function indicator */
 
@@ -1360,7 +1353,7 @@ public:
   TABLE_LIST *convert_right_join();
   List<Item>* get_item_list();
   ulong get_table_join_options();
-  void set_lock_for_tables(thr_lock_type lock_type);
+  void set_lock_for_tables(thr_lock_type lock_type, bool for_update);
   /*
     This method created for reiniting LEX in mysql_admin_table() and can be
     used only if you are going remove all SELECT_LEX & units except belonger
@@ -1494,8 +1487,7 @@ public:
   void collect_grouping_fields_for_derived(THD *thd, ORDER *grouping_list);
   bool collect_grouping_fields(THD *thd);
   bool collect_fields_equal_to_grouping(THD *thd);
-  void check_cond_extraction_for_grouping_fields(THD *thd, Item *cond,
-                                                 Pushdown_checker excl_dep);
+  void check_cond_extraction_for_grouping_fields(THD *thd, Item *cond);
   Item *build_cond_for_grouping_fields(THD *thd, Item *cond,
                                        bool no_to_clones);
   
@@ -1521,13 +1513,11 @@ public:
   bool cond_pushdown_is_allowed() const
   { return !olap && !explicit_limit && !tvc; }
   
-  bool build_pushable_cond_for_having_pushdown(THD *thd,
-                                               Item *cond);
+  bool build_pushable_cond_for_having_pushdown(THD *thd, Item *cond);
   void pushdown_cond_into_where_clause(THD *thd, Item *extracted_cond,
                                        Item **remaining_cond,
                                        Item_transformer transformer,
                                        uchar *arg);
-  void mark_or_conds_to_avoid_pushdown(Item *cond);
   Item *pushdown_from_having_into_where(THD *thd, Item *having);
 
   select_handler *find_select_handler(THD *thd);
@@ -2153,6 +2143,38 @@ public:
   }
 
   /**
+    Checks either a trans/non trans temporary table is being accessed while
+    executing a statement.
+
+    @return
+      @retval TRUE  if a temporary table is being accessed
+      @retval FALSE otherwise
+  */
+  inline bool stmt_accessed_temp_table()
+  {
+    DBUG_ENTER("THD::stmt_accessed_temp_table");
+    DBUG_RETURN(stmt_accessed_non_trans_temp_table() ||
+                stmt_accessed_trans_temp_table());
+  }
+
+  /**
+    Checks if a temporary transactional table is being accessed while executing
+    a statement.
+
+    @return
+      @retval TRUE  if a temporary transactional table is being accessed
+      @retval FALSE otherwise
+  */
+  inline bool stmt_accessed_trans_temp_table()
+  {
+    DBUG_ENTER("THD::stmt_accessed_trans_temp_table");
+
+    DBUG_RETURN((stmt_accessed_table_flag &
+                ((1U << STMT_READS_TEMP_TRANS_TABLE) |
+                 (1U << STMT_WRITES_TEMP_TRANS_TABLE))) != 0);
+  }
+
+  /**
     Checks if a temporary non-transactional table is about to be accessed
     while executing a statement.
 
@@ -2695,7 +2717,7 @@ private:
   int scan_ident_start(THD *thd, Lex_ident_cli_st *str);
   int scan_ident_middle(THD *thd, Lex_ident_cli_st *str,
                         CHARSET_INFO **cs, my_lex_states *);
-  int scan_ident_delimited(THD *thd, Lex_ident_cli_st *str);
+  int scan_ident_delimited(THD *thd, Lex_ident_cli_st *str, uchar quote_char);
   bool get_7bit_or_8bit_ident(THD *thd, uchar *last_char);
 
   /** Current thread. */
@@ -3302,7 +3324,7 @@ public:
 
   enum enum_yes_no_unknown tx_chain, tx_release;
   bool safe_to_cache_query;
-  bool subqueries, ignore;
+  bool ignore;
   bool next_is_main; // use "main" SELECT_LEX for nrxt allocation;
   bool next_is_down; // use "main" SELECT_LEX for nrxt allocation;
   st_parsing_options parsing_options;
@@ -3326,7 +3348,6 @@ public:
   sp_name *spname;
   bool sp_lex_in_use;   // Keep track on lex usage in SPs for error handling
   bool all_privileges;
-  bool proxy_priv;
 
   sp_pcontext *spcont;
 
@@ -4407,8 +4428,6 @@ public:
     many_values.empty();
     insert_list= 0;
   }
-  bool tvc_finalize();
-  bool tvc_finalize_derived();
 
   bool make_select_in_brackets(SELECT_LEX* dummy_select,
                                SELECT_LEX *nselect, bool automatic);
@@ -4465,6 +4484,7 @@ public:
                                   LEX_CSTRING *alias);
   bool parsed_create_view(SELECT_LEX_UNIT *unit, int check);
   bool select_finalize(st_select_lex_unit *expr);
+  bool select_finalize(st_select_lex_unit *expr, Lex_select_lock l);
   void relink_hack(st_select_lex *select_lex);
 
   bool stmt_install_plugin(const DDL_options_st &opt,
@@ -4519,6 +4539,7 @@ public:
                                 const Lex_ident_sys_st &name,
                                 Item_result return_type,
                                 const LEX_CSTRING &soname);
+  Spvar_definition *row_field_name(THD *thd, const Lex_ident_sys_st &name);
 };
 
 
@@ -4635,18 +4656,6 @@ public:
 };
 
 /**
-  Input parameters to the parser.
-*/
-struct Parser_input
-{
-  bool m_compute_digest;
-
-  Parser_input()
-    : m_compute_digest(false)
-  {}
-};
-
-/**
   Internal state of the parser.
   The complete state consist of:
   - state data used during lexical parsing,
@@ -4673,7 +4682,6 @@ public:
   ~Parser_state()
   {}
 
-  Parser_input m_input;
   Lex_input_stream m_lip;
   Yacc_state m_yacc;
 
@@ -4818,6 +4826,8 @@ Item* handle_sql2003_note184_exception(THD *thd, Item* left, bool equal,
 
 void sp_create_assignment_lex(THD *thd, bool no_lookahead);
 bool sp_create_assignment_instr(THD *thd, bool no_lookahead);
+
+void mark_or_conds_to_avoid_pushdown(Item *cond);
 
 #endif /* MYSQL_SERVER */
 #endif /* SQL_LEX_INCLUDED */

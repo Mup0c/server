@@ -12,7 +12,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1335  USA */
 
 #include "sql_plugin.h"                         // Includes mariadb.h
 #include "sql_priv.h"
@@ -214,9 +214,6 @@ typedef fp_except fp_except_t;
 #ifndef HAVE_FCNTL
 #define fcntl(X,Y,Z) 0
 #endif
-
-extern "C" my_bool reopen_fstreams(const char *filename,
-                                   FILE *outstream, FILE *errstream);
 
 inline void setup_fpu()
 {
@@ -492,7 +489,7 @@ ulonglong query_cache_size=0;
 ulong query_cache_limit=0;
 ulong executed_events=0;
 query_id_t global_query_id;
-ulong aborted_threads, aborted_connects;
+ulong aborted_threads, aborted_connects, aborted_connects_preauth;
 ulong delayed_insert_timeout, delayed_insert_limit, delayed_queue_size;
 ulong delayed_insert_threads, delayed_insert_writes, delayed_rows_in_use;
 ulong delayed_insert_errors,flush_time;
@@ -889,6 +886,7 @@ PSI_mutex_key key_LOCK_relaylog_end_pos;
 PSI_mutex_key key_LOCK_thread_id;
 PSI_mutex_key key_LOCK_slave_state, key_LOCK_binlog_state,
   key_LOCK_rpl_thread, key_LOCK_rpl_thread_pool, key_LOCK_parallel_entry;
+PSI_mutex_key key_LOCK_rpl_semi_sync_master_enabled;
 PSI_mutex_key key_LOCK_binlog;
 
 PSI_mutex_key key_LOCK_stats,
@@ -983,6 +981,7 @@ static PSI_mutex_info all_server_mutexes[]=
   { &key_LOCK_rpl_thread_pool, "LOCK_rpl_thread_pool", 0},
   { &key_LOCK_parallel_entry, "LOCK_parallel_entry", 0},
   { &key_LOCK_ack_receiver, "Ack_receiver::mutex", 0},
+  { &key_LOCK_rpl_semi_sync_master_enabled, "LOCK_rpl_semi_sync_master_enabled", 0},
   { &key_LOCK_binlog, "LOCK_binlog", 0}
 };
 
@@ -1454,7 +1453,7 @@ scheduler_functions *thread_scheduler= &thread_scheduler_struct,
 
 #ifdef HAVE_OPENSSL
 #include <openssl/crypto.h>
-#ifdef HAVE_OPENSSL10
+#if defined(HAVE_OPENSSL10) && !defined(HAVE_WOLFSSL)
 typedef struct CRYPTO_dynlock_value
 {
   mysql_rwlock_t lock;
@@ -2113,7 +2112,7 @@ static void clean_up_mutexes()
   mysql_mutex_destroy(&LOCK_global_index_stats);
 #ifdef HAVE_OPENSSL
   mysql_mutex_destroy(&LOCK_des_key_file);
-#ifdef HAVE_OPENSSL10
+#if defined(HAVE_OPENSSL10) && !defined(HAVE_WOLFSSL)
   for (int i= 0; i < CRYPTO_num_locks(); ++i)
     mysql_rwlock_destroy(&openssl_stdlocks[i].lock);
   OPENSSL_free(openssl_stdlocks);
@@ -2558,13 +2557,19 @@ static void network_init(void)
 
 void close_connection(THD *thd, uint sql_errno)
 {
+  int lvl= (thd->main_security_ctx.user ? 3 : 1);
   DBUG_ENTER("close_connection");
 
   if (sql_errno)
+  {
     net_send_error(thd, sql_errno, ER_DEFAULT(sql_errno), NULL);
-
-  thd->print_aborted_warning(3, sql_errno ? ER_DEFAULT(sql_errno)
-                                          : "CLOSE_CONNECTION");
+    thd->print_aborted_warning(lvl, ER_DEFAULT(sql_errno));
+  }
+  else
+    thd->print_aborted_warning(lvl, (thd->main_security_ctx.user ?
+                                     "This connection closed normally" :
+                                     "This connection closed normally without"
+                                      " authentication"));
 
   thd->disconnect();
 
@@ -2724,9 +2729,8 @@ static bool cache_thread(THD *thd)
         Create new instrumentation for the new THD job,
         and attach it to this running pthread.
       */
-      PSI_thread *psi= PSI_CALL_new_thread(key_thread_one_connection,
-                                                   thd, thd->thread_id);
-      PSI_CALL_set_thread(psi);
+      PSI_CALL_set_thread(PSI_CALL_new_thread(key_thread_one_connection,
+                                              thd, thd->thread_id));
 
       /* reset abort flag for the thread */
       thd->mysys_var->abort= 0;
@@ -3863,6 +3867,39 @@ static int init_early_variables()
   return 0;
 }
 
+#ifdef _WIN32
+static void get_win_tzname(char* buf, size_t size)
+{
+  static struct
+  {
+    const wchar_t* windows_name;
+    const char*  tzdb_name;
+  }
+  tz_data[] =
+  {
+#include "win_tzname_data.h"
+    {0,0}
+  };
+  DYNAMIC_TIME_ZONE_INFORMATION  tzinfo;
+  if (GetDynamicTimeZoneInformation(&tzinfo) == TIME_ZONE_ID_UNKNOWN)
+  {
+    strncpy(buf, "unknown", size);
+    return;
+  }
+
+  for (size_t i= 0; tz_data[i].windows_name; i++)
+  {
+    if (wcscmp(tzinfo.TimeZoneKeyName, tz_data[i].windows_name) == 0)
+    {
+      strncpy(buf, tz_data[i].tzdb_name, size);
+      return;
+    }
+  }
+  wcstombs(buf, tzinfo.TimeZoneKeyName, size);
+  buf[size-1]= 0;
+  return;
+}
+#endif
 
 static int init_common_variables()
 {
@@ -3918,22 +3955,13 @@ static int init_common_variables()
   if (ignore_db_dirs_init())
     exit(1);
 
-#ifdef HAVE_TZNAME
+#ifdef _WIN32
+  get_win_tzname(system_time_zone, sizeof(system_time_zone));
+#elif defined(HAVE_TZNAME)
   struct tm tm_tmp;
   localtime_r(&server_start_time,&tm_tmp);
   const char *tz_name=  tzname[tm_tmp.tm_isdst != 0 ? 1 : 0];
-#ifdef _WIN32
-  /*
-    Time zone name may be localized and contain non-ASCII characters,
-    Convert from ANSI encoding to UTF8.
-  */
-  wchar_t wtz_name[sizeof(system_time_zone)];
-  mbstowcs(wtz_name, tz_name, sizeof(system_time_zone)-1);
-  WideCharToMultiByte(CP_UTF8,0, wtz_name, -1, system_time_zone, 
-    sizeof(system_time_zone) - 1, NULL, NULL);
-#else
   strmake_buf(system_time_zone, tz_name);
-#endif /* _WIN32 */
 #endif /* HAVE_TZNAME */
 
   /*
@@ -4522,7 +4550,7 @@ static int init_thread_environment()
 #ifdef HAVE_OPENSSL
   mysql_mutex_init(key_LOCK_des_key_file,
                    &LOCK_des_key_file, MY_MUTEX_INIT_FAST);
-#ifdef HAVE_OPENSSL10
+#if defined(HAVE_OPENSSL10) && !defined(HAVE_WOLFSSL)
   openssl_stdlocks= (openssl_lock_t*) OPENSSL_malloc(CRYPTO_num_locks() *
                                                      sizeof(openssl_lock_t));
   for (int i= 0; i < CRYPTO_num_locks(); ++i)
@@ -4567,7 +4595,7 @@ static int init_thread_environment()
 }
 
 
-#ifdef HAVE_OPENSSL10
+#if defined(HAVE_OPENSSL10) && !defined(HAVE_WOLFSSL)
 static openssl_lock_t *openssl_dynlock_create(const char *file, int line)
 {
   openssl_lock_t *lock= new openssl_lock_t;
@@ -4739,9 +4767,7 @@ int reinit_ssl()
   {
     my_printf_error(ER_UNKNOWN_ERROR, "Failed to refresh SSL, error: %s", MYF(0),
       sslGetErrString(error));
-#ifndef HAVE_YASSL
     ERR_clear_error();
-#endif
     return 1;
   }
   mysql_rwlock_wrlock(&LOCK_ssl_refresh);
@@ -5194,14 +5220,8 @@ static int init_server_components()
 #endif
 
 #ifndef EMBEDDED_LIBRARY
-  {
-    if (Session_tracker::server_boot_verify(system_charset_info))
-    {
-      sql_print_error("The variable session_track_system_variables has "
-		      "invalid values.");
-      unireg_abort(1);
-    }
-  }
+  if (session_tracker_init())
+    return 1;
 #endif //EMBEDDED_LIBRARY
 
   /* we do want to exit if there are any other unknown options */
@@ -5921,7 +5941,7 @@ int mysqld_main(int argc, char **argv)
       CloseHandle(hEventShutdown);
   }
 #endif
-#if (defined(HAVE_OPENSSL) && !defined(HAVE_YASSL)) && !defined(EMBEDDED_LIBRARY)
+#if (defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY))
   ERR_remove_state(0);
 #endif
   mysqld_exit(0);
@@ -7077,15 +7097,14 @@ struct my_option my_long_options[]=
   MYSQL_TO_BE_IMPLEMENTED_OPTION("optimizer-trace-features"),     // OPTIMIZER_TRACE
   MYSQL_TO_BE_IMPLEMENTED_OPTION("optimizer-trace-offset"),       // OPTIMIZER_TRACE
   MYSQL_TO_BE_IMPLEMENTED_OPTION("optimizer-trace-limit"),        // OPTIMIZER_TRACE
-  MYSQL_TO_BE_IMPLEMENTED_OPTION("eq-range-index-dive-limit"),
   MYSQL_COMPATIBILITY_OPTION("server-id-bits"),
   MYSQL_TO_BE_IMPLEMENTED_OPTION("slave-rows-search-algorithms"), // HAVE_REPLICATION
   MYSQL_TO_BE_IMPLEMENTED_OPTION("slave-allow-batching"),         // HAVE_REPLICATION
   MYSQL_COMPATIBILITY_OPTION("slave-checkpoint-period"),      // HAVE_REPLICATION
   MYSQL_COMPATIBILITY_OPTION("slave-checkpoint-group"),       // HAVE_REPLICATION
   MYSQL_SUGGEST_ANALOG_OPTION("slave-pending-jobs-size-max", "--slave-parallel-max-queued"),  // HAVE_REPLICATION
-  MYSQL_TO_BE_IMPLEMENTED_OPTION("sha256-password-private-key-path"), // HAVE_OPENSSL && !HAVE_YASSL
-  MYSQL_TO_BE_IMPLEMENTED_OPTION("sha256-password-public-key-path"),  // HAVE_OPENSSL && !HAVE_YASSL
+  MYSQL_TO_BE_IMPLEMENTED_OPTION("sha256-password-private-key-path"), // HAVE_OPENSSL
+  MYSQL_TO_BE_IMPLEMENTED_OPTION("sha256-password-public-key-path"),  // HAVE_OPENSSL
 
   /* The following options exist in 5.5 and 5.6 but not in 10.0 */
   MYSQL_SUGGEST_ANALOG_OPTION("abort-slave-event-count", "--debug-abort-slave-event-count"),
@@ -7317,13 +7336,13 @@ static int show_ssl_get_verify_mode(THD *thd, SHOW_VAR *var, char *buff,
 {
   var->type= SHOW_LONG;
   var->value= buff;
-#ifndef HAVE_YASSL
+#ifndef HAVE_WOLFSSL
   if( thd->net.vio && thd->net.vio->ssl_arg )
     *((long *)buff)= (long)SSL_get_verify_mode((SSL*)thd->net.vio->ssl_arg);
   else
     *((long *)buff)= 0;
 #else
-  *((long *)buff) = 0;
+  *((long *)buff)= 0;
 #endif
   return 0;
 }
@@ -7333,14 +7352,10 @@ static int show_ssl_get_verify_depth(THD *thd, SHOW_VAR *var, char *buff,
 {
   var->type= SHOW_LONG;
   var->value= buff;
-#ifndef HAVE_YASSL
   if( thd->vio_ok() && thd->net.vio->ssl_arg )
     *((long *)buff)= (long)SSL_get_verify_depth((SSL*)thd->net.vio->ssl_arg);
   else
     *((long *)buff)= 0;
-#else
-  *((long *)buff)= 0;
-#endif
 
   return 0;
 }
@@ -7401,15 +7416,6 @@ DEF_SHOW_FUNC(net_wait_num, SHOW_LONGLONG)
 DEF_SHOW_FUNC(avg_net_wait_time, SHOW_LONG)
 DEF_SHOW_FUNC(avg_trx_wait_time, SHOW_LONG)
 
-#ifdef HAVE_YASSL
-
-static char *
-my_asn1_time_to_string(const ASN1_TIME *time, char *buf, size_t len)
-{
-  return yaSSL_ASN1_TIME_to_string(time, buf, len);
-}
-
-#else /* openssl */
 
 static char *
 my_asn1_time_to_string(const ASN1_TIME *time, char *buf, size_t len)
@@ -7436,8 +7442,6 @@ end:
   BIO_free(bio);
   return res;
 }
-
-#endif
 
 
 /**
@@ -7620,6 +7624,7 @@ int show_threadpool_idle_threads(THD *thd, SHOW_VAR *var, char *buff,
 SHOW_VAR status_vars[]= {
   {"Aborted_clients",          (char*) &aborted_threads,        SHOW_LONG},
   {"Aborted_connects",         (char*) &aborted_connects,       SHOW_LONG},
+  {"Aborted_connects_preauth", (char*) &aborted_connects_preauth, SHOW_LONG},
   {"Acl",                      (char*) acl_statistics,          SHOW_ARRAY},
   {"Access_denied_errors",     (char*) offsetof(STATUS_VAR, access_denied_errors), SHOW_LONG_STATUS},
   {"Binlog_bytes_written",     (char*) offsetof(STATUS_VAR, binlog_bytes_written), SHOW_LONGLONG_STATUS},
@@ -7666,6 +7671,7 @@ SHOW_VAR status_vars[]= {
   {"Feature_locale",           (char*) offsetof(STATUS_VAR, feature_locale), SHOW_LONG_STATUS},
   {"Feature_subquery",         (char*) offsetof(STATUS_VAR, feature_subquery), SHOW_LONG_STATUS},
   {"Feature_system_versioning",   (char*) offsetof(STATUS_VAR, feature_system_versioning), SHOW_LONG_STATUS},
+  {"Feature_application_time_periods", (char*) offsetof(STATUS_VAR, feature_application_time_periods), SHOW_LONG_STATUS},
   {"Feature_timezone",         (char*) offsetof(STATUS_VAR, feature_timezone), SHOW_LONG_STATUS},
   {"Feature_trigger",          (char*) offsetof(STATUS_VAR, feature_trigger), SHOW_LONG_STATUS},
   {"Feature_window_functions", (char*) offsetof(STATUS_VAR, feature_window_functions), SHOW_LONG_STATUS},
@@ -7708,7 +7714,7 @@ SHOW_VAR status_vars[]= {
   {"Memory_used",              (char*) &show_memory_used, SHOW_SIMPLE_FUNC},
   {"Memory_used_initial",      (char*) &start_memory_used, SHOW_LONGLONG},
   {"Not_flushed_delayed_rows", (char*) &delayed_rows_in_use,    SHOW_LONG_NOFLUSH},
-  {"Open_files",               (char*) &my_file_opened,         SHOW_LONG_NOFLUSH},
+  {"Open_files",               (char*) &my_file_opened,         SHOW_SINT},
   {"Open_streams",             (char*) &my_stream_opened,       SHOW_LONG_NOFLUSH},
   {"Open_table_definitions",   (char*) &show_table_definitions, SHOW_SIMPLE_FUNC},
   {"Open_tables",              (char*) &show_open_tables,       SHOW_SIMPLE_FUNC},
@@ -8030,7 +8036,7 @@ static int mysql_init_variables(void)
   opt_using_transactions= 0;
   abort_loop= select_thread_in_use= signal_thread_in_use= 0;
   grant_option= 0;
-  aborted_threads= aborted_connects= 0;
+  aborted_threads= aborted_connects= aborted_connects_preauth= 0;
   subquery_cache_miss= subquery_cache_hit= 0;
   delayed_insert_threads= delayed_insert_writes= delayed_rows_in_use= 0;
   delayed_insert_errors= thread_created= 0;
@@ -8122,7 +8128,7 @@ static int mysql_init_variables(void)
 
 #if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
   have_ssl=SHOW_OPTION_YES;
-#if defined(HAVE_YASSL)
+#if defined(HAVE_WOLFSSL)
   have_openssl= SHOW_OPTION_NO;
 #else
   have_openssl= SHOW_OPTION_YES;
@@ -8390,7 +8396,8 @@ mysqld_get_one_option(int optid, const struct my_option *opt, char *argument)
     val= p--;
     while (my_isspace(mysqld_charset, *p) && p > argument)
       *p-- = 0;
-    if (p == argument)
+    /* Db name can be one char also */
+    if (p == argument && my_isspace(mysqld_charset, *p))
     {
       sql_print_error("Bad syntax in replicate-rewrite-db - empty FROM db!");
       return 1;

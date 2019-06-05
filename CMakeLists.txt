@@ -12,7 +12,7 @@
 # 
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1335 USA
 
 CMAKE_MINIMUM_REQUIRED(VERSION 2.8.7)
 
@@ -25,7 +25,8 @@ ENDIF()
 
 MESSAGE(STATUS "Running cmake version ${CMAKE_VERSION}")
 
-SET(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_SOURCE_DIR}/cmake)
+SET(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH}
+  ${CMAKE_SOURCE_DIR}/cmake ${CMAKE_SOURCE_DIR}/cmake/Internal/CPack)
 
 # Use a default manufacturer if no manufacturer was identified.
 IF(NOT DEFINED MANUFACTURER) 
@@ -38,10 +39,7 @@ SET(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING
    "Choose the type of build, options are: None(CMAKE_CXX_FLAGS or CMAKE_C_FLAGS used) Debug Release RelWithDebInfo MinSizeRel")
 
 # MAX_INDEXES - Set the maximum number of indexes per table, default 64
-IF (NOT MAX_INDEXES)
-  SET(MAX_INDEXES 64)
-ENDIF(NOT MAX_INDEXES)
-
+SET(MAX_INDEXES 64 CACHE STRING "Max number of indexes")
 IF (${MAX_INDEXES} GREATER 128)
   MESSAGE(FATAL_ERROR "MAX_INDEXES values greater than 128 is not supported!")
 ENDIF()
@@ -227,7 +225,7 @@ IF (WITH_UBSAN)
   IF(SECURITY_HARDENED)
     MESSAGE(FATAL_ERROR "WITH_UBSAN and SECURITY_HARDENED are mutually exclusive")
   ENDIF()
-  MY_CHECK_AND_SET_COMPILER_FLAG("-fsanitize=undefined" DEBUG RELWITHDEBINFO)
+  MY_CHECK_AND_SET_COMPILER_FLAG("-fsanitize=undefined -fno-sanitize=alignment" DEBUG RELWITHDEBINFO)
 ENDIF()
 
 IF(NOT WITH_TSAN)
@@ -297,6 +295,16 @@ ELSEIF(WITH_SAFEMALLOC MATCHES "AUTO" AND NOT WIN32 AND NOT WITH_VALGRIND)
   SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -DSAFEMALLOC")
 ENDIF()
 
+# Another memory debugging feature
+SET(TRASH_FREED_MEMORY "AUTO" CACHE STRING "Fill freed memory with specific byte pattern. Will result in slower execution. Options are: ON OFF AUTO.")
+MARK_AS_ADVANCED(TRASH_FREED_MEMORY)
+IF(TRASH_FREED_MEMORY MATCHES "ON")
+  ADD_DEFINITIONS( -DTRASH_FREED_MEMORY)
+ELSEIF(TRASH_FREED_MEMORY MATCHES "AUTO" AND NOT WIN32 AND NOT WITH_VALGRIND AND NOT WITH_ASAN)
+  SET(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -DTRASH_FREED_MEMORY")
+  SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -DTRASH_FREED_MEMORY")
+ENDIF()
+
 # Set commonly used variables
 IF(WIN32)
   SET(DEFAULT_MYSQL_HOME "C:/Program Files/MariaDB ${MYSQL_BASE_VERSION}")
@@ -338,7 +346,7 @@ IF(NOT HAVE_CXX_NEW)
 ENDIF()
 
 # Find header files from the bundled libraries
-# (yassl, readline, pcre, etc)
+# (wolfssl, readline, pcre, etc)
 # before the ones installed in the system
 SET(CMAKE_INCLUDE_DIRECTORIES_PROJECT_BEFORE ON)
 
@@ -351,7 +359,7 @@ INCLUDE_DIRECTORIES(${CMAKE_CURRENT_BINARY_DIR}/include)
 
 # Add bundled or system zlib.
 MYSQL_CHECK_ZLIB_WITH_COMPRESS()
-# Add bundled yassl/taocrypt or system openssl.
+# Add bundled wolfssl/wolfcrypt or system openssl.
 MYSQL_CHECK_SSL()
 # Add readline or libedit.
 MYSQL_CHECK_READLINE()
@@ -495,7 +503,7 @@ ADD_CUSTOM_TARGET(INFO_BIN ALL
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 
-INSTALL_DOCUMENTATION(README.md CREDITS COPYING COPYING.thirdparty
+INSTALL_DOCUMENTATION(README.md CREDITS COPYING THIRDPARTY
                       EXCEPTIONS-CLIENT COMPONENT Readme)
 
 # MDEV-6526 these files are not installed anymore
@@ -505,6 +513,8 @@ INSTALL_DOCUMENTATION(README.md CREDITS COPYING COPYING.thirdparty
 IF(UNIX)
   INSTALL_DOCUMENTATION(Docs/INSTALL-BINARY Docs/README-wsrep COMPONENT Readme)
 ENDIF()
+
+INCLUDE(build_depends)
 
 INCLUDE(CPack)
 

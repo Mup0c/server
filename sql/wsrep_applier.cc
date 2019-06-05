@@ -11,7 +11,7 @@
 
    You should have received a copy of the GNU General Public License along
    with this program; if not, write to the Free Software Foundation, Inc.,
-   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA. */
+   51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA. */
 
 #include "mariadb.h"
 #include "mysql/service_wsrep.h"
@@ -184,12 +184,6 @@ int wsrep_apply_events(THD*        thd,
     thd->set_server_id(ev->server_id);
     thd->set_time();                            // time the query
     thd->transaction.start_time.reset(thd);
-    //#define mariadb_10_4_0
-#ifdef mariadb_10_4_0
-    wsrep_xid_init(&thd->transaction.xid_state.xid,
-                   thd->wsrep_trx_meta.gtid.uuid,
-                   thd->wsrep_trx_meta.gtid.seqno);
-#endif
     thd->lex->current_select= 0;
     if (!ev->when)
     {

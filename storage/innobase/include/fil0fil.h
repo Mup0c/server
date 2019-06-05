@@ -13,7 +13,7 @@ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
-51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -33,6 +33,9 @@ Created 10/25/1995 Heikki Tuuri
 
 #include "log0recv.h"
 #include "dict0types.h"
+#ifdef UNIV_LINUX
+# include <set>
+#endif
 
 // Forward declaration
 extern my_bool srv_use_doublewrite_buf;
@@ -86,6 +89,9 @@ struct fil_space_t {
 				Protected by log_sys.mutex.
 				If and only if this is nonzero, the
 				tablespace will be in named_spaces. */
+	/** Log sequence number of the latest MLOG_INDEX_LOAD record
+	that was found while parsing the redo log */
+	lsn_t		enable_lsn;
 	bool		stop_new_ops;
 				/*!< we set this true when we start
 				deleting a single-table tablespace.
@@ -102,7 +108,7 @@ struct fil_space_t {
 	bool		is_being_truncated;
 #ifdef UNIV_DEBUG
 	/** reference count for operations who want to skip redo log in the
-	file space in order to make fsp_space_modify_check pass. */
+	file space in order to make modify_check() pass. */
 	Atomic_counter<ulint> redo_skipped_count;
 #endif
 	fil_type_t	purpose;/*!< purpose */
@@ -128,7 +134,7 @@ struct fil_space_t {
 				the tablespace to disk; dropping of the
 				tablespace is forbidden if this is positive */
 	/** Number of pending buffer pool operations accessing the tablespace
-	without holding a table lock or dict_operation_lock S-latch
+	without holding a table lock or dict_sys.latch S-latch
 	that would prevent the table (and tablespace) from being
 	dropped. An example is change buffer merge.
 	The tablespace cannot be dropped while this is nonzero,
@@ -195,6 +201,12 @@ struct fil_space_t {
 	fil_node_t* add(const char* name, pfs_os_file_t handle,
 			ulint size, bool is_raw, bool atomic_write,
 			ulint max_pages = ULINT_MAX);
+#ifdef UNIV_DEBUG
+	/** Assert that the mini-transaction is compatible with
+	updating an allocation bitmap page.
+	@param[in]	mtr	mini-transaction */
+	void modify_check(const mtr_t& mtr) const;
+#endif /* UNIV_DEBUG */
 
 	/** Try to reserve free extents.
 	@param[in]	n_free_now	current number of free extents
@@ -234,7 +246,10 @@ struct fil_space_t {
 	/** Note that the tablespace has been imported.
 	Initially, purpose=FIL_TYPE_IMPORT so that no redo log is
 	written while the space ID is being updated in each page. */
-	void set_imported();
+	inline void set_imported();
+
+	/** @return whether the storage device is rotational (HDD, not SSD) */
+	inline bool is_rotational() const;
 
 	/** Open each file. Only invoked on fil_system.temp_space.
 	@return whether all files were opened */
@@ -537,6 +552,8 @@ struct fil_node_t {
 	pfs_os_file_t	handle;
 	/** whether the file actually is a raw device or disk partition */
 	bool		is_raw_disk;
+	/** whether the file is on non-rotational media (SSD) */
+	bool		on_ssd;
 	/** size of the file in database pages (0 if not known yet);
 	the possible last incomplete megabyte may be ignored
 	if space->id == 0 */
@@ -579,12 +596,38 @@ struct fil_node_t {
 	@return	whether the page was found valid */
 	bool read_page0(bool first);
 
+	/** Determine some file metadata when creating or reading the file.
+	@param	file	the file that is being created, or OS_FILE_CLOSED */
+	void find_metadata(os_file_t file = OS_FILE_CLOSED
+#ifdef UNIV_LINUX
+			   , struct stat* statbuf = NULL
+#endif
+			   );
+
 	/** Close the file handle. */
 	void close();
 };
 
 /** Value of fil_node_t::magic_n */
 #define	FIL_NODE_MAGIC_N	89389
+
+inline void fil_space_t::set_imported()
+{
+	ut_ad(purpose == FIL_TYPE_IMPORT);
+	purpose = FIL_TYPE_TABLESPACE;
+	UT_LIST_GET_FIRST(chain)->find_metadata();
+}
+
+inline bool fil_space_t::is_rotational() const
+{
+	for (const fil_node_t* node = UT_LIST_GET_FIRST(chain);
+	     node != NULL; node = UT_LIST_GET_NEXT(chain, node)) {
+		if (!node->on_ssd) {
+			return true;
+		}
+	}
+	return false;
+}
 
 /** Common InnoDB file extentions */
 enum ib_extention {
@@ -853,6 +896,22 @@ struct fil_system_t {
 
 private:
   bool m_initialised;
+#ifdef UNIV_LINUX
+  /** available block devices that reside on non-rotational storage */
+  std::vector<dev_t> ssd;
+public:
+  /** @return whether a file system device is on non-rotational storage */
+  bool is_ssd(dev_t dev) const
+  {
+    /* Linux seems to allow up to 15 partitions per block device.
+    If the detected ssd carries "partition number 0" (it is the whole device),
+    compare the candidate file system number without the partition number. */
+    for (const auto s : ssd)
+      if (dev == s || (dev & ~15U) == s)
+        return true;
+    return false;
+  }
+#endif
 public:
 	ib_mutex_t	mutex;		/*!< The mutex protecting the cache */
 	fil_space_t*	sys_space;	/*!< The innodb_system tablespace */
@@ -900,6 +959,31 @@ public:
 					/*!< whether fil_space_create()
 					has issued a warning about
 					potential space_id reuse */
+
+	/** Trigger a call to fil_node_t::read_page0()
+	@param[in]	id	tablespace identifier
+	@return	tablespace
+	@retval	NULL	if the tablespace does not exist or cannot be read */
+	fil_space_t* read_page0(ulint id);
+
+	/** Return the next fil_space_t from key rotation list.
+	Once started, the caller must keep calling this until it returns NULL.
+	fil_space_acquire() and fil_space_release() are invoked here which
+	blocks a concurrent operation from dropping the tablespace.
+	@param[in]      prev_space      Previous tablespace or NULL to start
+					from beginning of fil_system->rotation
+					list
+	@param[in]      recheck         recheck of the tablespace is needed or
+					still encryption thread does write page0
+					for it
+	@param[in]	key_version	key version of the key state thread
+	If NULL, use the first fil_space_t on fil_system->space_list.
+	@return pointer to the next fil_space_t.
+	@retval NULL if this was the last */
+	fil_space_t* keyrotate_next(
+		fil_space_t*	prev_space,
+		bool		remove,
+		uint		key_version);
 };
 
 /** The tablespace memory cache. */
@@ -1084,11 +1168,12 @@ fil_space_acquire() and fil_space_t::release() are invoked here which
 blocks a concurrent operation from dropping the tablespace.
 @param[in,out]	prev_space	Pointer to the previous fil_space_t.
 If NULL, use the first fil_space_t on fil_system.space_list.
+@param[in]	remove		Whether to remove the previous tablespace from
+				the rotation list
 @return pointer to the next fil_space_t.
 @retval NULL if this was the last*/
 fil_space_t*
-fil_space_keyrotate_next(
-	fil_space_t*	prev_space)
+fil_space_keyrotate_next(fil_space_t* prev_space, bool remove)
 	MY_ATTRIBUTE((warn_unused_result));
 
 /********************************************************//**
@@ -1122,8 +1207,7 @@ but only by InnoDB table locks, which may be broken by
 lock_remove_all_on_table().)
 @param[in]	table	persistent table
 checked @return whether the table is accessible */
-bool
-fil_table_accessible(const dict_table_t* table)
+bool fil_table_accessible(const dict_table_t* table)
 	MY_ATTRIBUTE((warn_unused_result, nonnull));
 
 /** Delete a tablespace and associated .ibd file.
@@ -1288,9 +1372,6 @@ memory cache. Note that if we have not done a crash recovery at the database
 startup, there may be many tablespaces which are not yet in the memory cache.
 @param[in]	id		Tablespace ID
 @param[in]	name		Tablespace name used in fil_space_create().
-@param[in]	print_error_if_does_not_exist
-				Print detailed error information to the
-error log if a matching tablespace is not found from memory.
 @param[in]	table_flags	table flags
 @return the tablespace
 @retval	NULL	if no matching tablespace exists in the memory cache */
@@ -1298,7 +1379,6 @@ fil_space_t*
 fil_space_for_table_exists_in_mem(
 	ulint		id,
 	const char*	name,
-	bool		print_error_if_does_not_exist,
 	ulint		table_flags);
 
 /** Try to extend a tablespace if it is smaller than the specified size.
@@ -1504,16 +1584,12 @@ fil_names_write_if_was_clean(
 	return(was_clean);
 }
 
-extern volatile bool	recv_recovery_on;
-
 /** During crash recovery, open a tablespace if it had not been opened
 yet, to get valid size and flags.
 @param[in,out]	space	tablespace */
-inline
-void
-fil_space_open_if_needed(
-	fil_space_t*	space)
+inline void fil_space_open_if_needed(fil_space_t* space)
 {
+	ut_d(extern volatile bool recv_recovery_on);
 	ut_ad(recv_recovery_on);
 
 	if (space->size == 0) {
@@ -1521,10 +1597,7 @@ fil_space_open_if_needed(
 		until the files are opened for the first time.
 		fil_space_get_size() will open the file
 		and adjust the size and flags. */
-#ifdef UNIV_DEBUG
-		ulint		size	=
-#endif /* UNIV_DEBUG */
-			fil_space_get_size(space->id);
+		ut_d(ulint size	=) fil_space_get_size(space->id);
 		ut_ad(size == space->size);
 	}
 }

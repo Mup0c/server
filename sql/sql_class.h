@@ -13,7 +13,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1335  USA */
 
 #ifndef SQL_CLASS_INCLUDED
 #define SQL_CLASS_INCLUDED
@@ -39,6 +39,7 @@
 #include "thr_timer.h"
 #include "thr_malloc.h"
 #include "log_slow.h"      /* LOG_SLOW_DISABLE_... */
+#include <my_tree.h>
 #include "sql_digest_stream.h"            // sql_digest_state
 #include <mysql/psi/mysql_stage.h>
 #include <mysql/psi/mysql_statement.h>
@@ -47,6 +48,7 @@
 #include <mysql_com_server.h>
 #include "session_tracker.h"
 #include "backup.h"
+#include "xa.h"
 
 extern "C"
 void set_thd_stage_info(void *thd,
@@ -64,6 +66,7 @@ void set_thd_stage_info(void *thd,
 
 #include "wsrep_mysqld.h"
 #ifdef WITH_WSREP
+#include <inttypes.h>
 /* wsrep-lib */
 #include "wsrep_client_service.h"
 #include "wsrep_client_state.h"
@@ -861,6 +864,8 @@ typedef struct system_status_var
   ulong feature_locale;		    /* +1 when LOCALE is set */
   ulong feature_subquery;	    /* +1 when subqueries are used */
   ulong feature_system_versioning;  /* +1 opening a table WITH SYSTEM VERSIONING */
+  ulong feature_application_time_periods;
+                                    /* +1 opening a table with application-time period */
   ulong feature_timezone;	    /* +1 when XPATH is used */
   ulong feature_trigger;	    /* +1 opening a table with triggers */
   ulong feature_xml;		    /* +1 when XPATH is used */
@@ -1272,50 +1277,6 @@ struct st_savepoint {
   /** State of metadata locks before this savepoint was set. */
   MDL_savepoint        mdl_savepoint;
 };
-
-enum xa_states {XA_NOTR=0, XA_ACTIVE, XA_IDLE, XA_PREPARED, XA_ROLLBACK_ONLY};
-extern const char *xa_state_names[];
-class XID_cache_element;
-
-typedef struct st_xid_state {
-  /* For now, this is only used to catch duplicated external xids */
-  XID  xid;                           // transaction identifier
-  enum xa_states xa_state;            // used by external XA only
-  /* Error reported by the Resource Manager (RM) to the Transaction Manager. */
-  uint rm_error;
-  XID_cache_element *xid_cache_element;
-
-  /**
-    Check that XA transaction has an uncommitted work. Report an error
-    to the user in case when there is an uncommitted work for XA transaction.
-
-    @return  result of check
-      @retval  false  XA transaction is NOT in state IDLE, PREPARED
-                      or ROLLBACK_ONLY.
-      @retval  true   XA transaction is in state IDLE or PREPARED
-                      or ROLLBACK_ONLY.
-  */
-
-  bool check_has_uncommitted_xa() const
-  {
-    if (xa_state == XA_IDLE ||
-        xa_state == XA_PREPARED ||
-        xa_state == XA_ROLLBACK_ONLY)
-    {
-      my_error(ER_XAER_RMFAIL, MYF(0), xa_state_names[xa_state]);
-      return true;
-    }
-    return false;
-  }
-} XID_STATE;
-
-void xid_cache_init(void);
-void xid_cache_free(void);
-XID_STATE *xid_cache_search(THD *thd, XID *xid);
-bool xid_cache_insert(XID *xid, enum xa_states xa_state);
-bool xid_cache_insert(THD *thd, XID_STATE *xid_state);
-void xid_cache_delete(THD *thd, XID_STATE *xid_state);
-int xid_cache_iterate(THD *thd, my_hash_walk_action action, void *argument);
 
 /**
   @class Security_context
@@ -2468,6 +2429,9 @@ public:
   */ 
   bool create_tmp_table_for_derived;
 
+  /* The flag to force reading statistics from EITS tables */
+  bool force_read_stats;
+
   bool save_prep_leaf_list;
 
   /* container for handler's private per-connection data */
@@ -2622,6 +2586,7 @@ public:
     THD_TRANS stmt;			// Trans for current statement
     bool on;                            // see ha_enable_transaction()
     XID_STATE xid_state;
+    XID implicit_xid;
     WT_THD wt;                          ///< for deadlock detection
     Rows_log_event *m_pending_rows_event;
 
@@ -2643,17 +2608,10 @@ public:
     MEM_ROOT mem_root; // Transaction-life memory allocation pool
     void cleanup()
     {
-      DBUG_ENTER("thd::cleanup");
+      DBUG_ENTER("THD::st_transactions::cleanup");
       changed_tables= 0;
       savepoints= 0;
-      /*
-        If rm_error is raised, it means that this piece of a distributed
-        transaction has failed and must be rolled back. But the user must
-        rollback it explicitly, so don't start a new distributed XA until
-        then.
-      */
-      if (!xid_state.rm_error)
-        xid_state.xid.null();
+      implicit_xid.null();
       free_root(&mem_root,MYF(MY_KEEP_PREALLOC));
       DBUG_VOID_RETURN;
     }
@@ -2664,7 +2622,7 @@ public:
     st_transactions()
     {
       bzero((char*)this, sizeof(*this));
-      xid_state.xid.null();
+      implicit_xid.null();
       init_sql_alloc(&mem_root, "THD::transactions",
                      ALLOC_ROOT_MIN_BLOCK_SIZE, 0,
                      MYF(MY_THREAD_SPECIFIC));
@@ -3282,17 +3240,12 @@ public:
   /**
     @param id                thread identifier
     @param is_wsrep_applier  thread type
-    @param skip_lock         instruct whether @c LOCK_global_system_variables
-                             is already locked, to not acquire it then.
   */
-  THD(my_thread_id id, bool is_wsrep_applier= false, bool skip_lock= false);
+  THD(my_thread_id id, bool is_wsrep_applier= false);
 
   ~THD();
-  /**
-    @param skip_lock         instruct whether @c LOCK_global_system_variables
-                             is already locked, to not acquire it then.
-  */
-  void init(bool skip_lock= false);
+
+  void init();
   /*
     Initialize memory roots necessary for query processing and (!)
     pre-allocate memory for it. We can't do that in THD constructor because
@@ -4547,10 +4500,10 @@ public:
   {
     query_id= new_query_id;
 #ifdef WITH_WSREP
-    if (WSREP(this))
+    if (WSREP_NNULL(this))
     {
       set_wsrep_next_trx_id(query_id);
-      WSREP_DEBUG("assigned new next trx id: %lu", wsrep_next_trx_id());
+      WSREP_DEBUG("assigned new next trx id: %" PRIu64, wsrep_next_trx_id());
     }
 #endif /* WITH_WSREP */
   }
@@ -4735,12 +4688,10 @@ public:
   };
   bool has_thd_temporary_tables();
 
-  TABLE *create_and_open_tmp_table(handlerton *hton,
-                                   LEX_CUSTRING *frm,
+  TABLE *create_and_open_tmp_table(LEX_CUSTRING *frm,
                                    const char *path,
                                    const char *db,
                                    const char *table_name,
-                                   bool open_in_engine,
                                    bool open_internal_tables);
 
   TABLE *find_temporary_table(const char *db, const char *table_name,
@@ -4777,13 +4728,12 @@ private:
   bool has_temporary_tables();
   uint create_tmp_table_def_key(char *key, const char *db,
                                 const char *table_name);
-  TMP_TABLE_SHARE *create_temporary_table(handlerton *hton, LEX_CUSTRING *frm,
+  TMP_TABLE_SHARE *create_temporary_table(LEX_CUSTRING *frm,
                                           const char *path, const char *db,
                                           const char *table_name);
   TABLE *find_temporary_table(const char *key, uint key_length,
                               Temporary_table_state state);
-  TABLE *open_temporary_table(TMP_TABLE_SHARE *share, const char *alias,
-                              bool open_in_engine);
+  TABLE *open_temporary_table(TMP_TABLE_SHARE *share, const char *alias);
   bool find_and_use_tmp_table(const TABLE_LIST *tl, TABLE **out_table);
   bool use_temporary_table(TABLE *table, TABLE **out_table);
   void close_temporary_table(TABLE *table);
@@ -5032,8 +4982,6 @@ public:
   Item *sp_fix_func_item(Item **it_addr);
   Item *sp_prepare_func_item(Item **it_addr, uint cols= 1);
   bool sp_eval_expr(Field *result_field, Item **expr_item_ptr);
-
-  bool having_pushdown;
 };
 
 /** A short cut for thd->get_stmt_da()->set_ok_status(). */

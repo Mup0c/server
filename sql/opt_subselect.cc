@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2010, 2015, MariaDB
+   Copyright (c) 2010, 2019, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -12,7 +12,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02111-1301 USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA */
 
 /**
   @file
@@ -28,6 +28,7 @@
 
 #include "mariadb.h"
 #include "sql_base.h"
+#include "sql_const.h"
 #include "sql_select.h"
 #include "filesort.h"
 #include "opt_subselect.h"
@@ -522,7 +523,7 @@ bool is_materialization_applicable(THD *thd, Item_in_subselect *in_subs,
         !child_select->is_part_of_union() &&                          // 1
         parent_unit->first_select()->leaf_tables.elements &&          // 2
         child_select->outer_select() &&
-        child_select->outer_select()->leaf_tables.elements &&         // 2A
+        child_select->outer_select()->table_list.first &&             // 2A
         subquery_types_allow_materialization(thd, in_subs) &&
         (in_subs->is_top_level_item() ||                               //3
          optimizer_flag(thd,
@@ -594,7 +595,8 @@ int check_and_do_in_subquery_rewrites(JOIN *join)
   {
     Item_in_subselect *in_subs= NULL;
     Item_allany_subselect *allany_subs= NULL;
-    switch (subselect->substype()) {
+    Item_subselect::subs_type substype= subselect->substype();
+    switch (substype) {
     case Item_subselect::IN_SUBS:
       in_subs= (Item_in_subselect *)subselect;
       break;
@@ -606,6 +608,26 @@ int check_and_do_in_subquery_rewrites(JOIN *join)
       break;
     }
 
+    /*
+      Try removing "ORDER BY" or even "ORDER BY ... LIMIT" from certain kinds
+      of subqueries. The removal might enable further transformations.
+    */
+    if (substype == Item_subselect::IN_SUBS ||
+        substype == Item_subselect::EXISTS_SUBS ||
+        substype == Item_subselect::ANY_SUBS ||
+        substype == Item_subselect::ALL_SUBS)
+    {
+      // (1) - ORDER BY without LIMIT can be removed from IN/EXISTS subqueries
+      // (2) - for EXISTS, can also remove "ORDER BY ... LIMIT n",
+      //       but cannot remove "ORDER BY ... LIMIT n OFFSET m"
+      if (!select_lex->select_limit ||                               // (1)
+          (substype == Item_subselect::EXISTS_SUBS &&                // (2)
+           !select_lex->offset_limit))                               // (2)
+      {
+        select_lex->join->order= 0;
+        select_lex->join->skip_sort_order= 1;
+      }
+    }
 
     /* Resolve expressions and perform semantic analysis for IN query */
     if (in_subs != NULL)
@@ -1397,8 +1419,8 @@ void get_delayed_table_estimates(TABLE *table,
   *startup_cost= item->jtbm_read_time;
 
   /* Calculate cost of scanning the temptable */
-  double data_size= item->jtbm_record_count * 
-                    hash_sj_engine->tmp_table->s->reclength;
+  double data_size= COST_MULT(item->jtbm_record_count,
+                              hash_sj_engine->tmp_table->s->reclength);
   /* Do like in handler::read_time */
   *scan_time= data_size/IO_SIZE + 2;
 } 
@@ -2473,7 +2495,8 @@ bool optimize_semijoin_nests(JOIN *join, table_map all_table_map)
           int tableno;
           double rows= 1.0;
           while ((tableno = tm_it.next_bit()) != Table_map_iterator::BITMAP_END)
-            rows *= join->map2table[tableno]->table->quick_condition_rows;
+            rows= COST_MULT(rows,
+			    join->map2table[tableno]->table->quick_condition_rows);
           sjm->rows= MY_MIN(sjm->rows, rows);
         }
         memcpy((uchar*) sjm->positions,
@@ -2586,7 +2609,7 @@ static uint get_tmp_table_rec_length(Ref_ptr_array p_items, uint elements)
 double
 get_tmp_table_lookup_cost(THD *thd, double row_count, uint row_size)
 {
-  if (row_count * row_size > thd->variables.max_heap_table_size)
+  if (row_count > thd->variables.max_heap_table_size / (double) row_size)
     return (double) DISK_TEMPTABLE_LOOKUP_COST;
   else
     return (double) HEAP_TEMPTABLE_LOOKUP_COST;
@@ -2993,8 +3016,11 @@ bool Sj_materialization_picker::check_qep(JOIN *join,
       }
 
       double mat_read_time= prefix_cost.total_cost();
-      mat_read_time += mat_info->materialization_cost.total_cost() +
-                       prefix_rec_count * mat_info->lookup_cost.total_cost();
+      mat_read_time=
+        COST_ADD(mat_read_time,
+                 COST_ADD(mat_info->materialization_cost.total_cost(),
+                          COST_MULT(prefix_rec_count,
+                                    mat_info->lookup_cost.total_cost())));
 
       /*
         NOTE: When we pick to use SJM[-Scan] we don't memcpy its POSITION
@@ -3034,9 +3060,12 @@ bool Sj_materialization_picker::check_qep(JOIN *join,
     }
 
     /* Add materialization cost */
-    prefix_cost += mat_info->materialization_cost.total_cost() +
-                   prefix_rec_count * mat_info->scan_cost.total_cost();
-    prefix_rec_count *= mat_info->rows;
+    prefix_cost=
+      COST_ADD(prefix_cost,
+               COST_ADD(mat_info->materialization_cost.total_cost(),
+                        COST_MULT(prefix_rec_count,
+                                  mat_info->scan_cost.total_cost())));
+    prefix_rec_count= COST_MULT(prefix_rec_count, mat_info->rows);
     
     uint i;
     table_map rem_tables= remaining_tables;
@@ -3051,8 +3080,8 @@ bool Sj_materialization_picker::check_qep(JOIN *join,
     {
       best_access_path(join, join->positions[i].table, rem_tables, i,
                        disable_jbuf, prefix_rec_count, &curpos, &dummy);
-      prefix_rec_count *= curpos.records_read;
-      prefix_cost += curpos.read_time;
+      prefix_rec_count= COST_MULT(prefix_rec_count, curpos.records_read);
+      prefix_cost= COST_ADD(prefix_cost, curpos.read_time);
     }
 
     *strategy= SJ_OPT_MATERIALIZE_SCAN;
@@ -3359,16 +3388,18 @@ bool Duplicate_weedout_picker::check_qep(JOIN *join,
     for (uint j= first_dupsweedout_table; j <= idx; j++)
     {
       POSITION *p= join->positions + j;
-      current_fanout *= p->records_read;
-      dups_cost += p->read_time + current_fanout / TIME_FOR_COMPARE;
+      current_fanout= COST_MULT(current_fanout, p->records_read);
+      dups_cost= COST_ADD(dups_cost,
+                          COST_ADD(p->read_time,
+                                   current_fanout / TIME_FOR_COMPARE));
       if (p->table->emb_sj_nest)
       {
-        sj_inner_fanout *= p->records_read;
+        sj_inner_fanout= COST_MULT(sj_inner_fanout, p->records_read);
         dups_removed_fanout |= p->table->table->map;
       }
       else
       {
-        sj_outer_fanout *= p->records_read;
+        sj_outer_fanout= COST_MULT(sj_outer_fanout, p->records_read);
         temptable_rec_size += p->table->table->file->ref_length;
       }
     }
@@ -3387,12 +3418,13 @@ bool Duplicate_weedout_picker::check_qep(JOIN *join,
                                                     sj_outer_fanout,
                                                     temptable_rec_size);
 
-    double write_cost= join->positions[first_tab].prefix_record_count* 
-                       sj_outer_fanout * one_write_cost;
-    double full_lookup_cost= join->positions[first_tab].prefix_record_count* 
-                             sj_outer_fanout* sj_inner_fanout * 
-                             one_lookup_cost;
-    dups_cost += write_cost + full_lookup_cost;
+    double write_cost= COST_MULT(join->positions[first_tab].prefix_record_count,
+                                 sj_outer_fanout * one_write_cost);
+    double full_lookup_cost=
+             COST_MULT(join->positions[first_tab].prefix_record_count,
+                       COST_MULT(sj_outer_fanout,
+                                 sj_inner_fanout * one_lookup_cost));
+    dups_cost= COST_ADD(dups_cost, COST_ADD(write_cost, full_lookup_cost));
     
     *read_time= dups_cost;
     *record_count= prefix_rec_count * sj_outer_fanout;
@@ -3539,8 +3571,8 @@ static void recalculate_prefix_record_count(JOIN *join, uint start, uint end)
     if (j == join->const_tables)
       prefix_count= 1.0;
     else
-      prefix_count= join->best_positions[j-1].prefix_record_count *
-                    join->best_positions[j-1].records_read;
+      prefix_count= COST_MULT(join->best_positions[j-1].prefix_record_count,
+			      join->best_positions[j-1].records_read);
 
     join->best_positions[j].prefix_record_count= prefix_count;
   }
@@ -4337,17 +4369,12 @@ SJ_TMP_TABLE::create_sj_weedout_tmp_table(THD *thd)
   table->temp_pool_slot = temp_pool_slot;
   table->copy_blobs= 1;
   table->in_use= thd;
-  table->quick_keys.init();
-  table->covering_keys.init();
-  table->keys_in_use_for_query.init();
 
   table->s= share;
   init_tmp_table_share(thd, share, "", 0, tmpname, tmpname);
   share->blob_field= blob_field;
   share->table_charset= NULL;
   share->primary_key= MAX_KEY;               // Indicate no primary key
-  share->keys_for_keyread.init();
-  share->keys_in_use.init();
 
   /* Create the field */
   {
@@ -4361,9 +4388,9 @@ SJ_TMP_TABLE::create_sj_weedout_tmp_table(THD *thd)
     if (!field)
       DBUG_RETURN(0);
     field->table= table;
-    field->key_start.init(0);
-    field->part_of_key.init(0);
-    field->part_of_sortkey.init(0);
+    field->key_start.clear_all();
+    field->part_of_key.clear_all();
+    field->part_of_sortkey.clear_all();
     field->unireg_check= Field::NONE;
     field->flags= (NOT_NULL_FLAG | BINARY_FLAG | NO_DEFAULT_VALUE_FLAG);
     field->reset_fields();
@@ -5601,44 +5628,44 @@ int select_value_catcher::send_data(List<Item> &items)
 
 /**
   @brief
-    Conjunct conditions after optimize_cond() call
+    Attach conditions to already optimized condition
 
-  @param thd               the thread handle
-  @param cond              the condition where to attach new conditions
-  @param cond_eq           IN/OUT the multiple equalities of cond
-  @param new_conds         IN/OUT the list of conditions needed to add
-  @param cond_value        the returned value of the condition
-  @param build_cond_equal  flag to control if COND_EQUAL elements for
-                           AND-conditions should be built
+  @param thd              the thread handle
+  @param cond             the condition to which add new conditions
+  @param cond_eq          IN/OUT the multiple equalities of cond
+  @param new_conds        the list of conditions to be added
+  @param cond_value       the returned value of the condition
+                          if it can be evaluated
 
   @details
-    The method creates new condition through conjunction of cond and
+    The method creates new condition through union of cond and
     the conditions from new_conds list.
     The method is called after optimize_cond() for cond. The result
-    of the conjunction should be the same as if it was done before the
+    of the union should be the same as if it was done before the
     the optimize_cond() call.
 
-  @retval NULL       if an error occurs
   @retval otherwise  the created condition
+  @retval NULL       if an error occurs
 */
 
 Item *and_new_conditions_to_optimized_cond(THD *thd, Item *cond,
                                            COND_EQUAL **cond_eq,
                                            List<Item> &new_conds,
-                                           Item::cond_result *cond_value,
-                                           bool build_cond_equal)
+                                           Item::cond_result *cond_value)
 {
   COND_EQUAL new_cond_equal;
   Item *item;
-  Item_equal *equality;
+  Item_equal *mult_eq;
   bool is_simplified_cond= false;
+  /* The list where parts of the new condition are stored. */
   List_iterator<Item> li(new_conds);
   List_iterator_fast<Item_equal> it(new_cond_equal.current_level);
 
   /*
-    Creates multiple equalities new_cond_equal from new_conds list
-    equalities. If multiple equality can't be created or the condition
-    from new_conds list isn't an equality the method leaves it in new_conds
+    Create multiple equalities from the equalities of the list new_conds.
+    Save the created multiple equalities in new_cond_equal.
+    If multiple equality can't be created or the condition
+    from new_conds list isn't an equality leave it in new_conds
     list.
 
     The equality can't be converted into the multiple equality if it
@@ -5664,149 +5691,218 @@ Item *and_new_conditions_to_optimized_cond(THD *thd, Item *cond,
       ((Item_cond*) cond)->functype() == Item_func::COND_AND_FUNC)
   {
     /*
-      cond is an AND-condition.
-      The method conjugates the AND-condition cond, created multiple
-      equalities new_cond_equal and remain conditions from new_conds.
-
-      First, the method disjoins multiple equalities of cond and
-      merges new_cond_equal multiple equalities with these equalities.
-      It checks if after the merge the multiple equalities are knowingly
-      true or false equalities.
-      It attaches to cond the conditions from new_conds list and the result
-      of the merge of multiple equalities. The multiple equalities are
-      attached only to the upper level of AND-condition cond. So they
-      should be pushed down to the inner levels of cond AND-condition
-      if needed. It is done by propagate_new_equalities().
+      Case when cond is an AND-condition.
+      Union AND-condition cond, created multiple equalities from
+      new_cond_equal and remaining conditions from new_conds.
     */
     COND_EQUAL *cond_equal= &((Item_cond_and *) cond)->m_cond_equal;
     List<Item_equal> *cond_equalities= &cond_equal->current_level;
     List<Item> *and_args= ((Item_cond_and *)cond)->argument_list();
-    and_args->disjoin((List<Item> *) cond_equalities);
-    and_args->append(&new_conds);
 
-    while ((equality= it++))
+    /*
+      Disjoin multiple equalities of cond.
+      Merge these multiple equalities with the multiple equalities of
+      new_cond_equal. Save the result in new_cond_equal.
+      Check if after the merge some multiple equalities are knowingly
+      true or false.
+    */
+    and_args->disjoin((List<Item> *) cond_equalities);
+    while ((mult_eq= it++))
     {
-      equality->upper_levels= 0;
-      equality->merge_into_list(thd, cond_equalities, false, false);
+      mult_eq->upper_levels= 0;
+      mult_eq->merge_into_list(thd, cond_equalities, false, false);
     }
     List_iterator_fast<Item_equal> ei(*cond_equalities);
-    while ((equality= ei++))
+    while ((mult_eq= ei++))
     {
-      if (equality->const_item() && !equality->val_int())
+      if (mult_eq->const_item() && !mult_eq->val_int())
         is_simplified_cond= true;
-      equality->fixed= 0;
-      if (equality->fix_fields(thd, NULL))
-        return NULL;
+      else
+      {
+        mult_eq->unfix_fields();
+        if (mult_eq->fix_fields(thd, NULL))
+          return NULL;
+      }
     }
 
+    li.rewind();
+    while ((item=li++))
+    {
+      /*
+        There still can be some equalities at not top level of new_conds
+        conditions that are not transformed into multiple equalities.
+        To transform them build_item_equal() is called.
+
+        Examples of not top level equalities:
+
+        1. (t1.a = 3) OR (t1.b > 5)
+            (t1.a = 3) - not top level equality.
+            It is inside OR condition
+
+        2. ((t3.d = t3.c) AND (t3.c < 15)) OR (t3.d > 1)
+           (t1.d = t3.c) - not top level equality.
+           It is inside AND condition which is a part of OR condition
+      */
+      if (item->type() == Item::COND_ITEM &&
+          ((Item_cond *)item)->functype() == Item_func::COND_OR_FUNC)
+      {
+        item= item->build_equal_items(thd,
+                                      &((Item_cond_and *) cond)->m_cond_equal,
+                                      false, NULL);
+      }
+      and_args->push_back(item, thd->mem_root);
+    }
     and_args->append((List<Item> *) cond_equalities);
     *cond_eq= &((Item_cond_and *) cond)->m_cond_equal;
-
-    propagate_new_equalities(thd, cond, cond_equalities,
-                             cond_equal->upper_levels,
-                             &is_simplified_cond);
-    cond= cond->propagate_equal_fields(thd,
-                                       Item::Context_boolean(),
-                                       cond_equal);
   }
   else
   {
     /*
-      cond isn't AND-condition or is NULL.
+      Case when cond isn't an AND-condition or is NULL.
       There can be several cases:
 
       1. cond is a multiple equality.
-         In this case cond is merged with the multiple equalities of
+         In this case merge cond with the multiple equalities of
          new_cond_equal.
-         The new condition is created with the conjunction of new_conds
-         list conditions and the result of merge of multiple equalities.
+         Create new condition from the created multiple equalities
+         and new_conds list conditions.
       2. cond is NULL
-         The new condition is created from the conditions of new_conds
-         list and multiple equalities from new_cond_equal.
+         Create new condition from new_conds list conditions
+         and multiple equalities from new_cond_equal.
       3. Otherwise
-         In this case the new condition is created from cond, remain conditions
-         from new_conds list and created multiple equalities from
-         new_cond_equal.
+         Create new condition through union of cond, conditions from new_conds
+         list and created multiple equalities from new_cond_equal.
     */
     List<Item> new_conds_list;
     /* Flag is set to true if cond is a multiple equality */
     bool is_mult_eq= (cond && cond->type() == Item::FUNC_ITEM &&
         ((Item_func*) cond)->functype() == Item_func::MULT_EQUAL_FUNC);
 
+    /*
+      If cond is non-empty and is not multiple equality save it as
+      a part of a new condition.
+    */
     if (cond && !is_mult_eq &&
         new_conds_list.push_back(cond, thd->mem_root))
       return NULL;
 
-    if (new_conds.elements > 0)
-    {
-      li.rewind();
-      while ((item=li++))
-      {
-        if (!item->is_fixed() && item->fix_fields(thd, NULL))
-          return NULL;
-        if (item->const_item() && !item->val_int())
-          is_simplified_cond= true;
-      }
-      new_conds_list.append(&new_conds);
-    }
-
+    /*
+      If cond is a multiple equality merge it with new_cond_equal
+      multiple equalities.
+    */
     if (is_mult_eq)
     {
       Item_equal *eq_cond= (Item_equal *)cond;
       eq_cond->upper_levels= 0;
       eq_cond->merge_into_list(thd, &new_cond_equal.current_level,
                                false, false);
+    }
 
-      while ((equality= it++))
+    /**
+      Fix created multiple equalities and check if they are knowingly
+      true or false.
+    */
+    List_iterator_fast<Item_equal> ei(new_cond_equal.current_level);
+    while ((mult_eq=ei++))
+    {
+      if (mult_eq->const_item() && !mult_eq->val_int())
+        is_simplified_cond= true;
+      else
       {
-        if (equality->const_item() && !equality->val_int())
-          is_simplified_cond= true;
-      }
-
-      if (new_cond_equal.current_level.elements +
-          new_conds_list.elements == 1)
-      {
-        it.rewind();
-        equality= it++;
-        equality->fixed= 0;
-        if (equality->fix_fields(thd, NULL))
+        mult_eq->unfix_fields();
+        if (mult_eq->fix_fields(thd, NULL))
           return NULL;
       }
-      (*cond_eq)->copy(new_cond_equal);
+    }
+
+    /*
+      Create AND condition if new condition will have two or
+      more elements.
+    */
+    Item_cond_and *and_cond= 0;
+    COND_EQUAL *inherited= 0;
+    if (new_conds_list.elements +
+        new_conds.elements +
+        new_cond_equal.current_level.elements > 1)
+    {
+      and_cond= new (thd->mem_root) Item_cond_and(thd);
+      and_cond->m_cond_equal.copy(new_cond_equal);
+      inherited= &and_cond->m_cond_equal;
+    }
+
+    li.rewind();
+    while ((item=li++))
+    {
+      /*
+        Look for the comment in the case when cond is an
+        AND condition above the build_equal_items() call.
+      */
+      if (item->type() == Item::COND_ITEM &&
+          ((Item_cond *)item)->functype() == Item_func::COND_OR_FUNC)
+      {
+        item= item->build_equal_items(thd, inherited, false, NULL);
+      }
+      new_conds_list.push_back(item, thd->mem_root);
     }
     new_conds_list.append((List<Item> *)&new_cond_equal.current_level);
 
-    if (new_conds_list.elements > 1)
+    if (and_cond)
     {
-      Item_cond_and *and_cond=
-        new (thd->mem_root) Item_cond_and(thd, new_conds_list);
-
-      and_cond->m_cond_equal.copy(new_cond_equal);
+      and_cond->argument_list()->append(&new_conds_list);
       cond= (Item *)and_cond;
-      *cond_eq= &((Item_cond_and *)cond)->m_cond_equal;
+      *cond_eq= &((Item_cond_and *) cond)->m_cond_equal;
     }
     else
     {
       List_iterator_fast<Item> iter(new_conds_list);
       cond= iter++;
+      if (cond->type() == Item::FUNC_ITEM &&
+          ((Item_func *)cond)->functype() == Item_func::MULT_EQUAL_FUNC)
+      {
+        if (!(*cond_eq))
+          *cond_eq= new COND_EQUAL();
+        (*cond_eq)->copy(new_cond_equal);
+      }
+      else
+        *cond_eq= 0;
     }
-
-    if (!cond->is_fixed() && cond->fix_fields(thd, NULL))
-      return NULL;
-
-    if (new_cond_equal.current_level.elements > 0)
-      cond= cond->propagate_equal_fields(thd,
-                                         Item::Context_boolean(),
-                                         &new_cond_equal);
   }
 
+  if (!cond)
+    return NULL;
+
+  if (*cond_eq)
+  {
+    /*
+      The multiple equalities are attached only to the upper level
+      of AND-condition cond.
+      Push them down to the bottom levels of cond AND-condition if needed.
+    */
+    propagate_new_equalities(thd, cond,
+                             &(*cond_eq)->current_level,
+                             0,
+                             &is_simplified_cond);
+    cond= cond->propagate_equal_fields(thd,
+                                       Item::Context_boolean(),
+                                       *cond_eq);
+    cond->update_used_tables();
+  }
+  /* Check if conds has knowingly true or false parts. */
+  if (cond &&
+      !is_simplified_cond &&
+      cond->walk(&Item::is_simplified_cond_processor, 0, 0))
+    is_simplified_cond= true;
+
+
   /*
-    If it was found that some of the created condition parts are knowingly
-    true or false equalities the method calls removes_eq_cond() to remove them
-    from cond and set the cond_value to the appropriate value.
+    If it was found that there are some knowingly true or false equalities
+    remove them  from cond and set cond_value to the appropriate value.
   */
-  if (is_simplified_cond)
+  if (cond && is_simplified_cond)
     cond= cond->remove_eq_conds(thd, cond_value, true);
+
+  if (cond && cond->fix_fields_if_needed(thd, NULL))
+    return NULL;
 
   return cond;
 }
@@ -6302,14 +6398,16 @@ bool JOIN::choose_subquery_plan(table_map join_tables)
       The cost of executing the subquery and storing its result in an indexed
       temporary table.
     */
-    double materialization_cost= inner_read_time_1 +
-                                 write_cost * inner_record_count_1;
+    double materialization_cost= COST_ADD(inner_read_time_1,
+                                          COST_MULT(write_cost,
+                                                    inner_record_count_1));
 
-    materialize_strategy_cost= materialization_cost +
-                               outer_lookup_keys * lookup_cost;
+    materialize_strategy_cost= COST_ADD(materialization_cost,
+                                        COST_MULT(outer_lookup_keys,
+                                                  lookup_cost));
 
     /* C.2 Compute the cost of the IN=>EXISTS strategy. */
-    in_exists_strategy_cost= outer_lookup_keys * inner_read_time_2;
+    in_exists_strategy_cost= COST_MULT(outer_lookup_keys, inner_read_time_2);
 
     /* C.3 Compare the costs and choose the cheaper strategy. */
     if (materialize_strategy_cost >= in_exists_strategy_cost)
@@ -6889,10 +6987,14 @@ bool Item_in_subselect::pushdown_cond_for_in_subquery(THD *thd, Item *cond)
     remaining_cond->transform(thd,
                               &Item::in_subq_field_transformer_for_having,
                               (uchar *)this);
-  if (!remaining_cond)
+  if (!remaining_cond ||
+      remaining_cond->walk(&Item::cleanup_excluding_const_fields_processor,
+                           0, 0))
     goto exit;
 
-  sel->mark_or_conds_to_avoid_pushdown(remaining_cond);
+  mark_or_conds_to_avoid_pushdown(remaining_cond);
+
+  sel->cond_pushed_into_having= remaining_cond;
 
 exit:
   thd->lex->current_select= save_curr_select;

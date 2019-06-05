@@ -12,7 +12,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1335  USA
 */
 
 #define MYSQL_LEX 1
@@ -442,7 +442,7 @@ bool mysql_create_view(THD *thd, TABLE_LIST *views,
   */
   if (lex->current_select->lock_type != TL_READ_DEFAULT)
   {
-    lex->current_select->set_lock_for_tables(TL_READ_DEFAULT);
+    lex->current_select->set_lock_for_tables(TL_READ_DEFAULT, false);
     view->mdl_request.set_type(MDL_EXCLUSIVE);
   }
 
@@ -1200,7 +1200,7 @@ bool mysql_make_view(THD *thd, TABLE_SHARE *share, TABLE_LIST *table,
       in which case the reinit call wasn't done.
       See MDEV-6668 for details.
     */
-    mysql_derived_reinit(thd, NULL, table);
+    mysql_handle_single_derived(thd->lex, table, DT_REINIT);
 
     DEBUG_SYNC(thd, "after_cached_view_opened");
     DBUG_RETURN(0);
@@ -1565,6 +1565,7 @@ bool mysql_make_view(THD *thd, TABLE_SHARE *share, TABLE_LIST *table,
         if (!tbl->sequence)
 	  tbl->lock_type= table->lock_type;
         tbl->mdl_request.set_type(table->mdl_request.type);
+        tbl->updating= table->updating;
       }
       /*
         If the view is mergeable, we might want to
@@ -1725,7 +1726,6 @@ bool mysql_make_view(THD *thd, TABLE_SHARE *share, TABLE_LIST *table,
     view_select->linkage= DERIVED_TABLE_TYPE;
     table->updatable= 0;
     table->effective_with_check= VIEW_CHECK_NONE;
-    old_lex->subqueries= TRUE;
 
     table->derived= &lex->unit;
   }

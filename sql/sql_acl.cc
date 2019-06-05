@@ -12,7 +12,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1335  USA */
 
 
 /*
@@ -119,6 +119,9 @@ class ACL_ACCESS {
 public:
   ulong sort;
   ulong access;
+  ACL_ACCESS()
+   :sort(0), access(0)
+  { }
 };
 
 /* ACL_HOST is used if no host is specified */
@@ -134,15 +137,25 @@ class ACL_USER_BASE :public ACL_ACCESS, public Sql_alloc
 {
 
 public:
+  ACL_USER_BASE()
+   :flags(0), user(null_clex_str)
+  {
+    bzero(&role_grants, sizeof(role_grants));
+  }
   uchar flags;           // field used to store various state information
   LEX_CSTRING user;
   /* list to hold references to granted roles (ACL_ROLE instances) */
   DYNAMIC_ARRAY role_grants;
+  const char *get_username() { return user.str; }
 };
 
-class ACL_USER :public ACL_USER_BASE
+class ACL_USER_PARAM
 {
 public:
+  ACL_USER_PARAM()
+  {
+    bzero(this, sizeof(*this));
+  }
   acl_host_and_ip host;
   size_t hostname_length;
   USER_RESOURCES user_resource;
@@ -161,6 +174,18 @@ public:
   {
     return !(auth= (AUTH*) alloc_root(root, (nauth= n)*sizeof(AUTH)));
   }
+};
+
+
+class ACL_USER :public ACL_USER_BASE,
+                public ACL_USER_PARAM
+{
+public:
+
+  ACL_USER() { }
+  ACL_USER(THD *thd, const LEX_USER &combo,
+           const Account_options &options,
+           const ulong privileges);
 
   ACL_USER *copy(MEM_ROOT *root)
   {
@@ -205,8 +230,6 @@ public:
   }
 
   bool eq(const char *user2, const char *host2) { return !cmp(user2, host2); }
-
-  const char *get_username(){ return user.str; }
 
   bool wild_eq(const char *user2, const char *host2, const char *ip2)
   {
@@ -1234,6 +1257,13 @@ class User_table_tabular: public User_table
 
   int setup_sysvars() const
   {
+    if (num_fields() < 13) // number of columns in 3.21
+    {
+      sql_print_error("Fatal error: mysql.user table is damaged or in "
+                      "unsupported 3.20 format.");
+      return 1;
+    }
+
     username_char_length= MY_MIN(m_table->field[1]->char_length(),
                                  USERNAME_CHAR_LENGTH);
     using_global_priv_table= false;
@@ -1792,6 +1822,8 @@ class Grant_tables
       {
         tl->init_one_table(&MYSQL_SCHEMA_NAME, &MYSQL_TABLE_NAME[i],
                            NULL, lock_type);
+        tl->open_type= OT_BASE_ONLY;
+        tl->i_s_requested_object= OPEN_TABLE_ONLY;
         tl->updating= lock_type >= TL_WRITE_ALLOW_WRITE;
         if (i >= FIRST_OPTIONAL_TABLE)
           tl->open_strategy= TABLE_LIST::OPEN_IF_EXISTS;
@@ -1812,6 +1844,8 @@ class Grant_tables
       TABLE_LIST *tl= tables + USER_TABLE;
       tl->init_one_table(&MYSQL_SCHEMA_NAME, &MYSQL_TABLE_NAME_USER,
                          NULL, lock_type);
+      tl->open_type= OT_BASE_ONLY;
+      tl->i_s_requested_object= OPEN_TABLE_ONLY;
       tl->updating= lock_type >= TL_WRITE_ALLOW_WRITE;
       p_user_table= &m_user_table_tabular;
       counter++;
@@ -1931,12 +1965,10 @@ enum enum_acl_lists
 
 ACL_ROLE::ACL_ROLE(ACL_USER *user, MEM_ROOT *root) : counter(0)
 {
-
   access= user->access;
   /* set initial role access the same as the table row privileges */
   initial_role_access= user->access;
   this->user= user->user;
-  bzero(&role_grants, sizeof(role_grants));
   bzero(&parent_grantee, sizeof(parent_grantee));
   flags= IS_ROLE;
 }
@@ -1947,7 +1979,6 @@ ACL_ROLE::ACL_ROLE(const char * rolename, ulong privileges, MEM_ROOT *root) :
   this->access= initial_role_access;
   this->user.str= safe_strdup_root(root, rolename);
   this->user.length= strlen(rolename);
-  bzero(&role_grants, sizeof(role_grants));
   bzero(&parent_grantee, sizeof(parent_grantee));
   flags= IS_ROLE;
 }
@@ -2348,7 +2379,6 @@ static bool acl_load(THD *thd, const Grant_tables& tables)
   {
     ACL_USER user;
     bool is_role= FALSE;
-    bzero(&user, sizeof(user));
     update_hostname(&user.host, user_table.get_host(&acl_memroot));
     char *username= safe_str(user_table.get_user(&acl_memroot));
     user.user.str= username;
@@ -3122,26 +3152,25 @@ static void acl_update_role(const char *rolename, ulong privileges)
 }
 
 
+ACL_USER::ACL_USER(THD *thd, const LEX_USER &combo,
+                   const Account_options &options,
+                   const ulong privileges)
+{
+  user= safe_lexcstrdup_root(&acl_memroot, combo.user);
+  update_hostname(&host, safe_strdup_root(&acl_memroot, combo.host.str));
+  hostname_length= combo.host.length;
+  sort= get_sort(2, host.hostname, user.str);
+  password_last_changed= thd->query_start();
+  password_lifetime= -1;
+  my_init_dynamic_array(&role_grants, sizeof(ACL_USER *), 0, 8, MYF(0));
+}
+
+
 static int acl_user_update(THD *thd, ACL_USER *acl_user, uint nauth,
-                           const ACL_USER *from, const LEX_USER &combo,
+                           const LEX_USER &combo,
                            const Account_options &options,
                            const ulong privileges)
 {
-  if (from)
-    *acl_user= *from;
-  else
-  {
-    bzero(acl_user, sizeof(*acl_user));
-    acl_user->user= safe_lexcstrdup_root(&acl_memroot, combo.user);
-    update_hostname(&acl_user->host, safe_strdup_root(&acl_memroot, combo.host.str));
-    acl_user->hostname_length= combo.host.length;
-    acl_user->sort= get_sort(2, acl_user->host.hostname, acl_user->user.str);
-    acl_user->password_last_changed= thd->query_start();
-    acl_user->password_lifetime= -1;
-    my_init_dynamic_array(&acl_user->role_grants, sizeof(ACL_USER *),
-                          0, 8, MYF(0));
-  }
-
   if (nauth)
   {
     if (acl_user->nauth >= nauth)
@@ -4424,8 +4453,9 @@ static int replace_user_table(THD *thd, const User_table &user_table,
       my_error(ER_PASSWORD_NO_MATCH, MYF(0));
       goto end;
     }
+    new_acl_user= old_row_exists ? *old_acl_user :
+                  ACL_USER(thd, *combo, lex->account_options, rights);
     if (acl_user_update(thd, &new_acl_user, nauth,
-                        old_row_exists ? old_acl_user : NULL,
                         *combo, lex->account_options, rights))
       goto end;
 
@@ -6255,7 +6285,7 @@ static bool merge_role_db_privileges(ACL_ROLE *grantee, const char *dbname,
   ulong access= 0, update_flags= 0;
   for (int *p= dbs.front(); p <= dbs.back(); p++)
   {
-    if (first<0 || (!dbname && strcmp(acl_dbs.at(*p).db, acl_dbs.at(*p-1).db)))
+    if (first<0 || (!dbname && strcmp(acl_dbs.at(p[0]).db, acl_dbs.at(p[-1]).db)))
     { // new db name series
       update_flags|= update_role_db(merged, first, access, grantee->user.str);
       merged= -1;
@@ -8798,13 +8828,13 @@ static const char *command_array[]=
   "LOCK TABLES", "EXECUTE", "REPLICATION SLAVE", "REPLICATION CLIENT",
   "CREATE VIEW", "SHOW VIEW", "CREATE ROUTINE", "ALTER ROUTINE",
   "CREATE USER", "EVENT", "TRIGGER", "CREATE TABLESPACE",
-  "DELETE VERSIONING ROWS"
+  "DELETE HISTORY"
 };
 
 static uint command_lengths[]=
 {
   6, 6, 6, 6, 6, 4, 6, 8, 7, 4, 5, 10, 5, 5, 14, 5, 23, 11, 7, 17, 18, 11, 9,
-  14, 13, 11, 5, 7, 17, 22,
+  14, 13, 11, 5, 7, 17, 14,
 };
 
 
@@ -12445,7 +12475,7 @@ struct MPVIO_EXT :public MYSQL_PLUGIN_VIO
 };
 
 /**
-  a helper function to report an access denied error in all the proper places
+  a helper function to report an access denied error in most proper places
 */
 static void login_failed_error(THD *thd)
 {
@@ -13699,6 +13729,8 @@ bool acl_authenticate(THD *thd, uint com_change_user_pkt_len)
 
   Security_context * const sctx= thd->security_ctx;
   const ACL_USER * acl_user= mpvio.acl_user;
+  if (!acl_user)
+    statistic_increment(aborted_connects_preauth, &LOCK_status);
 
   if (acl_user)
   {
@@ -13963,10 +13995,26 @@ bool acl_authenticate(THD *thd, uint com_change_user_pkt_len)
   /* Change a database if necessary */
   if (mpvio.db.length)
   {
-    if (mysql_change_db(thd, &mpvio.db, FALSE))
+    uint err = mysql_change_db(thd, &mpvio.db, FALSE);
+    if(err)
     {
-      /* mysql_change_db() has pushed the error message. */
-      status_var_increment(thd->status_var.access_denied_errors);
+      if (err == ER_DBACCESS_DENIED_ERROR)
+      {
+        /*
+          Got an "access denied" error, which must be handled
+          other access denied errors (see login_failed_error()).
+          mysql_change_db() already sent error to client, and
+          wrote to general log, we only need to increment the counter
+          and maybe write a warning to error log.
+        */
+        status_var_increment(thd->status_var.access_denied_errors);
+        if (global_system_variables.log_warnings > 1)
+        {
+          Security_context* sctx = thd->security_ctx;
+          sql_print_warning(ER_THD(thd, err),
+            sctx->priv_user, sctx->priv_host, mpvio.db.str);
+        }
+      }
       DBUG_RETURN(1);
     }
   }

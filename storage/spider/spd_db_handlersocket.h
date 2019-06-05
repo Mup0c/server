@@ -11,7 +11,7 @@
 
   You should have received a copy of the GNU General Public License
   along with this program; if not, write to the Free Software
-  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA */
 
 #define SPIDER_HS_CONN dena::hstcpcli_ptr
 #define SPIDER_HS_CONN_CREATE dena::hstcpcli_i::create
@@ -58,6 +58,10 @@ public:
   int append_sql_log_off(
     spider_string *str,
     bool sql_log_off
+  );
+  int append_wait_timeout(
+    spider_string *str,
+    int wait_timeout
   );
   int append_time_zone(
     spider_string *str,
@@ -378,6 +382,11 @@ public:
   bool set_sql_log_off_in_bulk_sql();
   int set_sql_log_off(
     bool sql_log_off,
+    int *need_mon
+  );
+  bool set_wait_timeout_in_bulk_sql();
+  int set_wait_timeout(
+    int wait_timeout,
     int *need_mon
   );
   bool set_time_zone_in_bulk_sql();

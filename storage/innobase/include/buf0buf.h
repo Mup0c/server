@@ -13,7 +13,7 @@ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
-51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -233,6 +233,15 @@ public:
 		return m_space == rhs.m_space && m_page_no == rhs.m_page_no;
 	}
 	bool operator!=(const page_id_t& rhs) const { return !(*this == rhs); }
+
+	bool operator<(const page_id_t& rhs) const
+	{
+		if (m_space == rhs.m_space) {
+			return m_page_no < rhs.m_page_no;
+		}
+
+		return m_space < rhs.m_space;
+	}
 
 	/** Retrieve the tablespace id.
 	@return tablespace id */
@@ -2491,8 +2500,7 @@ struct	CheckInLRUList {
 
 	static void validate(const buf_pool_t* buf_pool)
 	{
-		CheckInLRUList	check;
-		ut_list_validate(buf_pool->LRU, check);
+		ut_list_validate(buf_pool->LRU, CheckInLRUList());
 	}
 };
 
@@ -2505,8 +2513,7 @@ struct	CheckInFreeList {
 
 	static void validate(const buf_pool_t* buf_pool)
 	{
-		CheckInFreeList	check;
-		ut_list_validate(buf_pool->free, check);
+		ut_list_validate(buf_pool->free, CheckInFreeList());
 	}
 };
 
@@ -2519,8 +2526,8 @@ struct	CheckUnzipLRUAndLRUList {
 
 	static void validate(const buf_pool_t* buf_pool)
 	{
-		CheckUnzipLRUAndLRUList	check;
-		ut_list_validate(buf_pool->unzip_LRU, check);
+		ut_list_validate(buf_pool->unzip_LRU,
+				 CheckUnzipLRUAndLRUList());
 	}
 };
 #endif /* UNIV_DEBUG || defined UNIV_BUF_DEBUG */

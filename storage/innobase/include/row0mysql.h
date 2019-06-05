@@ -13,7 +13,7 @@ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
-51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -290,17 +290,6 @@ row_unlock_for_mysql(
 	ibool		has_latches_on_recs);
 
 /*********************************************************************//**
-Checks if a table name contains the string "/#sql" which denotes temporary
-tables in MySQL.
-@return true if temporary table */
-bool
-row_is_mysql_tmp_table_name(
-/*========================*/
-	const char*	name) MY_ATTRIBUTE((warn_unused_result));
-				/*!< in: table name in the form
-				'database/tablename' */
-
-/*********************************************************************//**
 Creates an query graph node of 'update' type to be used in the MySQL
 interface.
 @return own: update node */
@@ -429,7 +418,7 @@ will remain locked.
 @param[in]	create_failed	true=create table failed
 				because e.g. foreign key column
 @param[in]	nonatomic	Whether it is permitted to release
-				and reacquire dict_operation_lock
+				and reacquire dict_sys.latch
 @return error code */
 dberr_t
 row_drop_table_for_mysql(
@@ -903,7 +892,7 @@ void innobase_free_row_for_vcol(VCOL_STORAGE *storage);
 @return the field filled with computed value */
 dfield_t*
 innobase_get_computed_value(
-	const dtuple_t*		row,
+	dtuple_t*		row,
 	const dict_v_col_t*	col,
 	const dict_index_t*	index,
 	mem_heap_t**		local_heap,

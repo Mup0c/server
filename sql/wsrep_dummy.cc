@@ -11,7 +11,7 @@
 
    You should have received a copy of the GNU General Public License along
    with this program; if not, write to the Free Software Foundation, Inc.,
-   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA. */
+   51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA. */
 
 #include "mariadb.h"
 #include <sql_class.h>
@@ -135,3 +135,6 @@ my_bool wsrep_get_debug()
 
 void wsrep_commit_ordered(THD* )
 { }
+
+my_bool wsrep_thd_is_applying(const THD*)
+{ return 0;}

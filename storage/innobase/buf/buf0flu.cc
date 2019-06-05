@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1995, 2017, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2013, 2018, MariaDB Corporation.
+Copyright (c) 2013, 2019, MariaDB Corporation.
 Copyright (c) 2013, 2014, Fusion-io
 
 This program is free software; you can redistribute it and/or modify it under
@@ -14,7 +14,7 @@ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
-51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -990,11 +990,6 @@ buf_flush_write_block_low(
 	ut_ad(!buf_page_get_mutex(bpage)->is_owned());
 	ut_ad(buf_page_get_io_fix(bpage) == BUF_IO_WRITE);
 	ut_ad(bpage->oldest_modification != 0);
-
-#ifdef UNIV_IBUF_COUNT_DEBUG
-	ut_a(ibuf_count_get(bpage->id) == 0);
-#endif /* UNIV_IBUF_COUNT_DEBUG */
-
 	ut_ad(bpage->newest_modification != 0);
 
 	/* Force the log to the disk before writing the modified block */
@@ -1314,9 +1309,13 @@ buf_flush_try_neighbors(
 	buf_pool_t*	buf_pool = buf_pool_get(page_id);
 
 	ut_ad(flush_type == BUF_FLUSH_LRU || flush_type == BUF_FLUSH_LIST);
+	fil_space_t* space = fil_space_acquire_for_io(page_id.space());
+	if (!space) {
+		return 0;
+	}
 
 	if (UT_LIST_GET_LEN(buf_pool->LRU) < BUF_LRU_OLD_MIN_LEN
-	    || srv_flush_neighbors == 0) {
+	    || !srv_flush_neighbors || !space->is_rotational()) {
 		/* If there is little space or neighbor flushing is
 		not enabled then just flush the victim. */
 		low = page_id.page_no();
@@ -1371,9 +1370,8 @@ buf_flush_try_neighbors(
 		}
 	}
 
-	const ulint	space_size = fil_space_get_size(page_id.space());
-	if (high > space_size) {
-		high = space_size;
+	if (high > space->size) {
+		high = space->size;
 	}
 
 	DBUG_PRINT("ib_buf", ("flush %u:%u..%u",
@@ -1449,6 +1447,8 @@ buf_flush_try_neighbors(
 		}
 		buf_pool_mutex_exit(buf_pool);
 	}
+
+	space->release_for_io();
 
 	if (count > 1) {
 		MONITOR_INC_VALUE_CUMULATIVE(
@@ -3034,7 +3034,7 @@ DECLARE_THREAD(buf_flush_page_cleaner_coordinator)(void*)
 		" See the man page of setpriority().";
 	}
 	/* Signal that setpriority() has been attempted. */
-	os_event_set(recv_sys->flush_end);
+	os_event_set(recv_sys.flush_end);
 #endif /* UNIV_LINUX */
 
 	do {
@@ -3042,13 +3042,13 @@ DECLARE_THREAD(buf_flush_page_cleaner_coordinator)(void*)
 		ulint	n_flushed_lru = 0;
 		ulint	n_flushed_list = 0;
 
-		os_event_wait(recv_sys->flush_start);
+		os_event_wait(recv_sys.flush_start);
 
 		if (!recv_writer_thread_active) {
 			break;
 		}
 
-		switch (recv_sys->flush_type) {
+		switch (recv_sys.flush_type) {
 		case BUF_FLUSH_LRU:
 			/* Flush pages from end of LRU if required */
 			pc_request(0, LSN_MAX);
@@ -3069,8 +3069,8 @@ DECLARE_THREAD(buf_flush_page_cleaner_coordinator)(void*)
 			ut_ad(0);
 		}
 
-		os_event_reset(recv_sys->flush_start);
-		os_event_set(recv_sys->flush_end);
+		os_event_reset(recv_sys.flush_start);
+		os_event_set(recv_sys.flush_end);
 	} while (recv_writer_thread_active);
 
 	os_event_wait(buf_flush_event);
@@ -3528,7 +3528,7 @@ buf_flush_request_force(
 
 /** Functor to validate the flush list. */
 struct	Check {
-	void	operator()(const buf_page_t* elem)
+	void operator()(const buf_page_t* elem) const
 	{
 		ut_a(elem->in_flush_list);
 	}
@@ -3545,11 +3545,10 @@ buf_flush_validate_low(
 {
 	buf_page_t*		bpage;
 	const ib_rbt_node_t*	rnode = NULL;
-	Check			check;
 
 	ut_ad(buf_flush_list_mutex_own(buf_pool));
 
-	ut_list_validate(buf_pool->flush_list, check);
+	ut_list_validate(buf_pool->flush_list, Check());
 
 	bpage = UT_LIST_GET_FIRST(buf_pool->flush_list);
 

@@ -13,7 +13,7 @@ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
-51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -186,7 +186,7 @@ buf_read_page_low(
 		thd_wait_end(NULL);
 	}
 
-	if (*err != DB_SUCCESS) {
+	if (UNIV_UNLIKELY(*err != DB_SUCCESS)) {
 		if (IORequest::ignore_missing(type)
 		    || *err == DB_TABLESPACE_DELETED) {
 			buf_read_page_handle_error(bpage);

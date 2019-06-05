@@ -13,7 +13,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335  USA */
 
 #include "mariadb.h"                          /* NO_EMBEDDED_ACCESS_CHECKS */
 #include "sql_priv.h"
@@ -181,6 +181,7 @@ sp_get_flags_for_command(LEX *lex)
   case SQLCOM_SHOW_EXPLAIN:
   case SQLCOM_SHOW_FIELDS:
   case SQLCOM_SHOW_FUNC_CODE:
+  case SQLCOM_SHOW_GENERIC:
   case SQLCOM_SHOW_GRANTS:
   case SQLCOM_SHOW_ENGINE_STATUS:
   case SQLCOM_SHOW_ENGINE_LOGS:
@@ -532,6 +533,7 @@ sp_head::sp_head(sp_package *parent, const Sp_handler *sph,
 
   DBUG_ENTER("sp_head::sp_head");
 
+  m_security_ctx.init();
   m_backpatch.empty();
   m_backpatch_goto.empty();
   m_cont_backpatch.empty();
@@ -1338,7 +1340,7 @@ sp_head::execute(THD *thd, bool merge_da_on_success)
     if (WSREP(thd) && thd->wsrep_next_trx_id() == WSREP_UNDEFINED_TRX_ID)
     {
       thd->set_wsrep_next_trx_id(thd->query_id);
-      WSREP_DEBUG("assigned new next trx ID for SP,  trx id: %lu", thd->wsrep_next_trx_id());
+      WSREP_DEBUG("assigned new next trx ID for SP,  trx id: %" PRIu64, thd->wsrep_next_trx_id());
     }
 #endif /* WITH_WSREP */
     err_status= i->execute(thd, &ip);
@@ -1484,7 +1486,7 @@ sp_head::execute(THD *thd, bool merge_da_on_success)
       NULL. In this case, mysql_change_db() would generate an error.
     */
 
-    err_status|= mysql_change_db(thd, (LEX_CSTRING*) &saved_cur_db_name, TRUE);
+    err_status|= mysql_change_db(thd, (LEX_CSTRING*)&saved_cur_db_name, TRUE) != 0;
   }
   m_flags&= ~IS_INVOKED;
   if (m_parent)
@@ -3212,7 +3214,7 @@ sp_head::show_routine_code(THD *thd)
       const char *format= "Instruction at position %u has m_ip=%u";
       char tmp[sizeof(format) + 2*SP_INSTR_UINT_MAXLEN + 1];
 
-      sprintf(tmp, format, ip, i->m_ip);
+      my_snprintf(tmp, sizeof(tmp), format, ip, i->m_ip);
       /*
         Since this is for debugging purposes only, we don't bother to
         introduce a special error code for it.
@@ -3604,32 +3606,45 @@ sp_instr_stmt::exec_core(THD *thd, uint *nextp)
                          3);
   int res= mysql_execute_command(thd);
 #ifdef WITH_WSREP
-  if ((thd->is_fatal_error || thd->killed_errno()) &&
-      (thd->wsrep_trx().state() == wsrep::transaction::s_executing))
+  if (WSREP(thd))
   {
-    /*
-      SP was killed, and it is not due to a wsrep conflict.
-      We skip after_statement hook at this point because
-      otherwise it clears the error, and cleans up the
-      whole transaction. For now we just return and finish
-      our handling once we are back to mysql_parse.
-     */
-    WSREP_DEBUG("Skipping after_command hook for killed SP");
-  }
-  else
-  {
-    (void) wsrep_after_statement(thd);
-    /*
-      Final wsrep error status for statement is known only after
-      wsrep_after_statement() call. If the error is set, override
-      error in thd diagnostics area and reset wsrep client_state error
-      so that the error does not get propagated via client-server protocol.
-    */
-    if (wsrep_current_error(thd))
+    if ((thd->is_fatal_error || thd->killed_errno()) &&
+        (thd->wsrep_trx().state() == wsrep::transaction::s_executing))
     {
-      wsrep_override_error(thd, wsrep_current_error(thd),
-                           wsrep_current_error_status(thd));
-      thd->wsrep_cs().reset_error();
+      /*
+        SP was killed, and it is not due to a wsrep conflict.
+        We skip after_statement hook at this point because
+        otherwise it clears the error, and cleans up the
+        whole transaction. For now we just return and finish
+        our handling once we are back to mysql_parse.
+      */
+      WSREP_DEBUG("Skipping after_command hook for killed SP");
+    }
+    else
+    {
+      const bool must_replay= wsrep_must_replay(thd);
+      (void) wsrep_after_statement(thd);
+      /*
+        Reset the return code to zero if the transaction was
+        replayed succesfully.
+      */
+      if (res && must_replay && !wsrep_current_error(thd))
+        res= 0;
+      /*
+        Final wsrep error status for statement is known only after
+        wsrep_after_statement() call. If the error is set, override
+        error in thd diagnostics area and reset wsrep client_state error
+        so that the error does not get propagated via client-server protocol.
+      */
+      if (wsrep_current_error(thd))
+      {
+        wsrep_override_error(thd, wsrep_current_error(thd),
+                             wsrep_current_error_status(thd));
+        thd->wsrep_cs().reset_error();
+        /* Reset also thd->killed if it has been set during BF abort. */
+        if (thd->killed == KILL_QUERY)
+          thd->reset_killed();
+      }
     }
   }
 #endif /* WITH_WSREP */

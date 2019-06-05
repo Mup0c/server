@@ -13,7 +13,7 @@ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
-51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -2581,7 +2581,7 @@ lock_move_granted_locks_to_front(
 		if (!lock->is_waiting()) {
 			lock_t* prev = UT_LIST_GET_PREV(trx_locks, lock);
 			ut_a(prev);
-			UT_LIST_MOVE_TO_FRONT(lock_list, lock);
+			ut_list_move_to_front(lock_list, lock);
 			lock = prev;
 		}
 	}
@@ -2669,7 +2669,7 @@ lock_move_reorganize_page(
 	lock_move_granted_locks_to_front(old_locks);
 
 	DBUG_EXECUTE_IF("do_lock_reverse_page_reorganize",
-			UT_LIST_REVERSE(old_locks););
+			ut_list_reverse(old_locks););
 
 	for (lock = UT_LIST_GET_FIRST(old_locks); lock;
 	     lock = UT_LIST_GET_NEXT(trx_locks, lock)) {
@@ -4620,29 +4620,6 @@ lock_print_info_summary(
 	return(TRUE);
 }
 
-/** Functor to print not-started transaction from the trx_list. */
-
-struct	PrintNotStarted {
-
-	PrintNotStarted(FILE* file) : m_file(file) { }
-
-	void	operator()(const trx_t* trx)
-	{
-		ut_ad(mutex_own(&trx_sys.mutex));
-
-		/* See state transitions and locking rules in trx0trx.h */
-
-		if (trx->mysql_thd
-		    && trx_state_eq(trx, TRX_STATE_NOT_STARTED)) {
-
-			fputs("---", m_file);
-			trx_print_latched(m_file, trx, 600);
-		}
-	}
-
-	FILE*		m_file;
-};
-
 /** Prints transaction lock wait and MVCC state.
 @param[in,out]	file	file where to print
 @param[in]	trx	transaction */
@@ -4715,29 +4692,24 @@ lock_trx_print_locks(
 	}
 }
 
-
-static my_bool lock_print_info_all_transactions_callback(
-  rw_trx_hash_element_t *element, FILE *file)
+/** Functor to display all transactions */
+struct lock_print_info
 {
-  mutex_enter(&element->mutex);
-  if (trx_t *trx= element->trx)
+  lock_print_info(FILE* file) : file(file) {}
+
+  void operator()(const trx_t* trx) const
   {
-    check_trx_state(trx);
+    ut_ad(mutex_own(&trx_sys.mutex));
+    if (trx == purge_sys.query->trx)
+      return;
     lock_trx_print_wait_and_mvcc_state(file, trx);
 
-    if (srv_print_innodb_lock_monitor)
-    {
-      trx->reference();
-      mutex_exit(&element->mutex);
+    if (trx->will_lock && srv_print_innodb_lock_monitor)
       lock_trx_print_locks(file, trx);
-      trx->release_reference();
-      return 0;
-    }
   }
-  mutex_exit(&element->mutex);
-  return 0;
-}
 
+  FILE* const file;
+};
 
 /*********************************************************************//**
 Prints info of locks for each transaction. This function assumes that the
@@ -4752,20 +4724,9 @@ lock_print_info_all_transactions(
 
 	fprintf(file, "LIST OF TRANSACTIONS FOR EACH SESSION:\n");
 
-	/* First print info on non-active transactions */
-
-	/* NOTE: information of auto-commit non-locking read-only
-	transactions will be omitted here. The information will be
-	available from INFORMATION_SCHEMA.INNODB_TRX. */
-
-	PrintNotStarted	print_not_started(file);
 	mutex_enter(&trx_sys.mutex);
-	ut_list_map(trx_sys.trx_list, print_not_started);
+	ut_list_map(trx_sys.trx_list, lock_print_info(file));
 	mutex_exit(&trx_sys.mutex);
-
-	trx_sys.rw_trx_hash.iterate_no_dups(
-		reinterpret_cast<my_hash_walk_action>
-		(lock_print_info_all_transactions_callback), file);
 	lock_mutex_exit();
 
 	ut_ad(lock_validate());
@@ -5523,6 +5484,20 @@ static void lock_rec_other_trx_holds_expl(trx_t *caller_trx, trx_t *trx,
   {
     ut_ad(!page_rec_is_metadata(rec));
     lock_mutex_enter();
+    ut_ad(trx->is_referenced());
+    /* Prevent a data race with trx_prepare(), which could change the
+    state from ACTIVE to PREPARED. Other state changes should be
+    blocked by lock_mutex_own() and trx->is_referenced(). */
+    trx_mutex_enter(trx);
+    const trx_state_t state = trx->state;
+    trx_mutex_exit(trx);
+    ut_ad(state != TRX_STATE_NOT_STARTED);
+    if (state == TRX_STATE_COMMITTED_IN_MEMORY)
+    {
+      /* The transaction was committed before our lock_mutex_enter(). */
+      lock_mutex_exit();
+      return;
+    }
     lock_rec_other_trx_holds_expl_arg arg= { page_rec_get_heap_no(rec), block,
                                              trx };
     trx_sys.rw_trx_hash.iterate(caller_trx,
@@ -6287,6 +6262,7 @@ lock_trx_release_locks(
 {
 	check_trx_state(trx);
 	ut_ad(trx_state_eq(trx, TRX_STATE_PREPARED)
+	      || trx_state_eq(trx, TRX_STATE_PREPARED_RECOVERED)
               || trx_state_eq(trx, TRX_STATE_ACTIVE));
 
 	bool release_lock = UT_LIST_GET_LEN(trx->lock.trx_locks) > 0;

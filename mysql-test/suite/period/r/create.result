@@ -1,5 +1,4 @@
-create or replace table t (id int primary key, s date, e date,
-period for mytime(s,e));
+create table t (id int primary key, s date, e date, period for mytime(s,e));
 # CONSTRAINT CHECK (s < e) is added implicitly, and shouldn't be shown
 # this is important for correct command-based replication
 show create table t;
@@ -93,4 +92,7 @@ t	CREATE TABLE `t` (
 ) ENGINE=MyISAM DEFAULT CHARSET=latin1
 insert t values (2, '2001-01-01', '2001-01-01');
 ERROR 23000: CONSTRAINT `mytime_1` failed for `test`.`t`
-create or replace database test;
+show status like "Feature_application_time_periods";
+Variable_name	Value
+Feature_application_time_periods	6
+drop table t;

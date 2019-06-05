@@ -18,7 +18,7 @@ GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
 along with this program; if not, write to the Free Software
-Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
+Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1335  USA
 
 *******************************************************
 
@@ -36,8 +36,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc.,
-51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
+this program; if not, write to the Free Software Foundation, Inc., 51 Franklin
+Street, Fifth Floor, Boston, MA 02110-1335 USA
 
 *******************************************************/
 
@@ -221,8 +221,6 @@ const char *defaults_group = "mysqld";
 #define HA_INNOBASE_ROWS_IN_TABLE 10000 /* to get optimization right */
 #define HA_INNOBASE_RANGE_COUNT	  100
 
-ulong 	innobase_large_page_size = 0;
-
 /* The default values for the following, type long or longlong, start-up
 parameters are declared in mysqld.cc: */
 
@@ -242,7 +240,6 @@ char*	innobase_data_home_dir;
 char*	innobase_data_file_path;
 
 my_bool innobase_use_doublewrite;
-my_bool innobase_use_large_pages;
 my_bool	innobase_file_per_table;
 my_bool innobase_locks_unsafe_for_binlog;
 my_bool innobase_rollback_on_timeout;
@@ -1917,8 +1914,6 @@ static bool innodb_init_param()
 
 	srv_use_doublewrite_buf = (ibool) innobase_use_doublewrite;
 
-	os_use_large_pages = (ibool) innobase_use_large_pages;
-	os_large_page_size = (ulint) innobase_large_page_size;
 	row_rollback_on_timeout = (ibool) innobase_rollback_on_timeout;
 
 	srv_file_per_table = (my_bool) innobase_file_per_table;
@@ -1989,10 +1984,8 @@ static bool innodb_init()
 	}
 
 	if (err != DB_SUCCESS) {
-		msg("mariabackup: innodb_init() returned %d (%s).",
+		die("mariabackup: innodb_init() returned %d (%s).",
 		    err, ut_strerr(err));
-		innodb_shutdown();
-		return(TRUE);
 	}
 
 	return(FALSE);
@@ -2674,7 +2667,7 @@ static lsn_t xtrabackup_copy_log(lsn_t start_lsn, lsn_t end_lsn, bool last)
 				log_block,
 				scanned_lsn + data_len);
 
-		recv_sys->scanned_lsn = scanned_lsn + data_len;
+		recv_sys.scanned_lsn = scanned_lsn + data_len;
 
 		if (data_len == OS_FILE_LOG_BLOCK_SIZE) {
 			/* We got a full log block. */
@@ -2726,13 +2719,13 @@ static lsn_t xtrabackup_copy_log(lsn_t start_lsn, lsn_t end_lsn, bool last)
 static bool xtrabackup_copy_logfile(bool last = false)
 {
 	ut_a(dst_log_file != NULL);
-	ut_ad(recv_sys != NULL);
+	ut_ad(recv_sys.is_initialised());
 
 	lsn_t	start_lsn;
 	lsn_t	end_lsn;
 
-	recv_sys->parse_start_lsn = log_copy_scanned_lsn;
-	recv_sys->scanned_lsn = log_copy_scanned_lsn;
+	recv_sys.parse_start_lsn = log_copy_scanned_lsn;
+	recv_sys.scanned_lsn = log_copy_scanned_lsn;
 
 	start_lsn = ut_uint64_align_down(log_copy_scanned_lsn,
 					 OS_FILE_LOG_BLOCK_SIZE);
@@ -2752,13 +2745,18 @@ static bool xtrabackup_copy_logfile(bool last = false)
 			my_sleep(1000);
 		}
 
-		start_lsn = (lsn == start_lsn)
-			? 0 : xtrabackup_copy_log(start_lsn, lsn, last);
+		if (lsn == start_lsn) {
+			start_lsn = 0;
+		} else {
+			mutex_enter(&recv_sys.mutex);
+			start_lsn = xtrabackup_copy_log(start_lsn, lsn, last);
+			mutex_exit(&recv_sys.mutex);
+		}
 
 		log_mutex_exit();
 
 		if (!start_lsn) {
-			msg(recv_sys->found_corrupt_log
+			msg(recv_sys.found_corrupt_log
 			    ? "xtrabackup_copy_logfile() failed: corrupt log."
 			    : "xtrabackup_copy_logfile() failed.");
 			return true;
@@ -3303,8 +3301,8 @@ static dberr_t xb_assign_undo_space_start()
 	buf = static_cast<byte*>(ut_malloc_nokey(2U << srv_page_size_shift));
 	page = static_cast<byte*>(ut_align(buf, srv_page_size));
 
-	if (!os_file_read(IORequestRead, file, page,
-			  0, srv_page_size)) {
+	if (os_file_read(IORequestRead, file, page, 0, srv_page_size)
+	    != DB_SUCCESS) {
 		msg("Reading first page failed.\n");
 		error = DB_ERROR;
 		goto func_exit;
@@ -3313,10 +3311,10 @@ static dberr_t xb_assign_undo_space_start()
 	fsp_flags = mach_read_from_4(
 			page + FSP_HEADER_OFFSET + FSP_SPACE_FLAGS);
 retry:
-	if (!os_file_read(IORequestRead, file, page,
-			  TRX_SYS_PAGE_NO << srv_page_size_shift,
-			  srv_page_size)) {
-		msg("Reading TRX_SYS page failed.\n");
+	if (os_file_read(IORequestRead, file, page,
+			 TRX_SYS_PAGE_NO << srv_page_size_shift,
+			 srv_page_size) != DB_SUCCESS) {
+		msg("Reading TRX_SYS page failed.");
 		error = DB_ERROR;
 		goto func_exit;
 	}
@@ -3994,9 +3992,7 @@ static bool xtrabackup_backup_low()
 
 /** Implement --backup
 @return	whether the operation succeeded */
-static
-bool
-xtrabackup_backup_func()
+static bool xtrabackup_backup_func()
 {
 	MY_STAT			 stat_info;
 	uint			 i;
@@ -4075,7 +4071,7 @@ fail:
 
 	ut_crc32_init();
 	crc_init();
-	recv_sys_init();
+	recv_sys.create();
 
 #ifdef WITH_INNODB_DISALLOW_WRITES
 	srv_allow_writes_event = os_event_create(0);
@@ -4129,43 +4125,33 @@ fail:
 
 	log_mutex_enter();
 
+reread_log_header:
 	dberr_t err = recv_find_max_checkpoint(&max_cp_field);
 
 	if (err != DB_SUCCESS) {
-log_fail:
+		msg("Error: cannot read redo log header");
 		log_mutex_exit();
 		goto fail;
 	}
 
 	if (log_sys.log.format == 0) {
-old_format:
-		msg("Error: cannot process redo log"
-		    " before MariaDB 10.2.2");
+		msg("Error: cannot process redo log before MariaDB 10.2.2");
 		log_mutex_exit();
-		goto log_fail;
+		goto fail;
 	}
 
 	const byte* buf = log_sys.checkpoint_buf;
-
-reread_log_header:
-	checkpoint_lsn_start = log_sys.log.lsn;
+	checkpoint_lsn_start = log_sys.log.get_lsn();
 	checkpoint_no_start = log_sys.next_checkpoint_no;
-
-	err = recv_find_max_checkpoint(&max_cp_field);
-
-	if (err != DB_SUCCESS) {
-		goto log_fail;
-	}
-
-	if (log_sys.log.format == 0) {
-		goto old_format;
-	}
 
 	log_header_read(max_cp_field);
 
-	if (checkpoint_no_start != mach_read_from_8(buf + LOG_CHECKPOINT_NO)) {
+	if (checkpoint_no_start != mach_read_from_8(buf + LOG_CHECKPOINT_NO)
+	    || checkpoint_lsn_start
+	    != mach_read_from_8(buf + LOG_CHECKPOINT_LSN)
+	    || log_sys.log.get_lsn_offset()
+	    != mach_read_from_8(buf + LOG_CHECKPOINT_OFFSET))
 		goto reread_log_header;
-	}
 
 	log_mutex_exit();
 
@@ -4179,42 +4165,45 @@ reread_log_header:
 	memset(&stat_info, 0, sizeof(MY_STAT));
 	dst_log_file = ds_open(ds_redo, "ib_logfile0", &stat_info);
 	if (dst_log_file == NULL) {
-		msg("§rror: failed to open the target stream for "
+		msg("Error: failed to open the target stream for "
 		    "'ib_logfile0'.");
 		goto fail;
 	}
 
 	/* label it */
-	byte MY_ALIGNED(OS_FILE_LOG_BLOCK_SIZE) log_hdr[OS_FILE_LOG_BLOCK_SIZE];
-	memset(log_hdr, 0, sizeof log_hdr);
-	mach_write_to_4(LOG_HEADER_FORMAT + log_hdr, log_sys.log.format);
-	mach_write_to_4(LOG_HEADER_SUBFORMAT + log_hdr, log_sys.log.subformat);
-	mach_write_to_8(LOG_HEADER_START_LSN + log_hdr, checkpoint_lsn_start);
-	strcpy(reinterpret_cast<char*>(LOG_HEADER_CREATOR + log_hdr),
-	       "Backup " MYSQL_SERVER_VERSION);
-	log_block_set_checksum(log_hdr,
-			       log_block_calc_checksum_crc32(log_hdr));
+	byte MY_ALIGNED(OS_FILE_LOG_BLOCK_SIZE) log_hdr_buf[LOG_FILE_HDR_SIZE];
+	memset(log_hdr_buf, 0, sizeof log_hdr_buf);
 
-	/* Write the log header. */
-	if (ds_write(dst_log_file, log_hdr, sizeof log_hdr)) {
-	log_write_fail:
+	byte *log_hdr_field = log_hdr_buf;
+	mach_write_to_4(LOG_HEADER_FORMAT + log_hdr_field, log_sys.log.format);
+	mach_write_to_4(LOG_HEADER_SUBFORMAT + log_hdr_field, log_sys.log.subformat);
+	mach_write_to_8(LOG_HEADER_START_LSN + log_hdr_field, checkpoint_lsn_start);
+	strcpy(reinterpret_cast<char*>(LOG_HEADER_CREATOR + log_hdr_field),
+		"Backup " MYSQL_SERVER_VERSION);
+	log_block_set_checksum(log_hdr_field,
+		log_block_calc_checksum_crc32(log_hdr_field));
+
+	/* copied from log_group_checkpoint() */
+	log_hdr_field +=
+		(log_sys.next_checkpoint_no & 1) ? LOG_CHECKPOINT_2 : LOG_CHECKPOINT_1;
+	/* The least significant bits of LOG_CHECKPOINT_OFFSET must be
+	stored correctly in the copy of the ib_logfile. The most significant
+	bits, which identify the start offset of the log block in the file,
+	we did choose freely, as LOG_FILE_HDR_SIZE. */
+	ut_ad(!((log_sys.log.get_lsn() ^ checkpoint_lsn_start)
+		& (OS_FILE_LOG_BLOCK_SIZE - 1)));
+	/* Adjust the checkpoint page. */
+	memcpy(log_hdr_field, log_sys.checkpoint_buf, OS_FILE_LOG_BLOCK_SIZE);
+	mach_write_to_8(log_hdr_field + LOG_CHECKPOINT_OFFSET,
+		(checkpoint_lsn_start & (OS_FILE_LOG_BLOCK_SIZE - 1))
+		| LOG_FILE_HDR_SIZE);
+	log_block_set_checksum(log_hdr_field,
+			log_block_calc_checksum_crc32(log_hdr_field));
+
+	/* Write log header*/
+	if (ds_write(dst_log_file, log_hdr_buf, sizeof(log_hdr_buf))) {
 		msg("error: write to logfile failed");
 		goto fail;
-	}
-	/* Adjust the checkpoint page. */
-	memcpy(log_hdr, buf, OS_FILE_LOG_BLOCK_SIZE);
-	mach_write_to_8(log_hdr + LOG_CHECKPOINT_OFFSET,
-			(checkpoint_lsn_start & (OS_FILE_LOG_BLOCK_SIZE - 1))
-			| LOG_FILE_HDR_SIZE);
-	log_block_set_checksum(log_hdr,
-			       log_block_calc_checksum_crc32(log_hdr));
-	/* Write checkpoint page 1 and two empty log pages before the
-	payload. */
-	if (ds_write(dst_log_file, log_hdr, OS_FILE_LOG_BLOCK_SIZE)
-	    || !memset(log_hdr, 0, sizeof log_hdr)
-	    || ds_write(dst_log_file, log_hdr, sizeof log_hdr)
-	    || ds_write(dst_log_file, log_hdr, sizeof log_hdr)) {
-		goto log_write_fail;
 	}
 
 	log_copying_running = true;
@@ -4242,7 +4231,7 @@ fail_before_log_copying_thread_start:
 
 	/* copy log file by current position */
 	log_copy_scanned_lsn = checkpoint_lsn_start;
-	recv_sys->recovered_lsn = log_copy_scanned_lsn;
+	recv_sys.recovered_lsn = log_copy_scanned_lsn;
 	log_optimized_ddl_op = backup_optimized_ddl_op;
 
 	if (xtrabackup_copy_logfile())
@@ -4630,7 +4619,7 @@ xb_space_create_file(
 
 	free(buf);
 
-	if (!ret) {
+	if (ret != DB_SUCCESS) {
 		msg("mariabackup: could not write the first page to %s",
 		    path);
 		os_file_close(*file);
@@ -4925,9 +4914,9 @@ xtrabackup_apply_delta(
 		/* first block of block cluster */
 		offset = ((incremental_buffers * (page_size / 4))
 			 << page_size_shift);
-		success = os_file_read(IORequestRead, src_file,
-				       incremental_buffer, offset, page_size);
-		if (!success) {
+		if (os_file_read(IORequestRead, src_file,
+				 incremental_buffer, offset, page_size)
+		    != DB_SUCCESS) {
 			goto error;
 		}
 
@@ -4957,10 +4946,10 @@ xtrabackup_apply_delta(
 		ut_a(last_buffer || page_in_buffer == page_size / 4);
 
 		/* read whole of the cluster */
-		success = os_file_read(IORequestRead, src_file,
-				       incremental_buffer,
-				       offset, page_in_buffer * page_size);
-		if (!success) {
+		if (os_file_read(IORequestRead, src_file,
+				 incremental_buffer,
+				 offset, page_in_buffer * page_size)
+		    != DB_SUCCESS) {
 			goto error;
 		}
 
@@ -5006,9 +4995,9 @@ xtrabackup_apply_delta(
 				}
 			}
 
-			success = os_file_write(IORequestWrite,
-						dst_path, dst_file, buf, off, page_size);
-			if (!success) {
+			if (os_file_write(IORequestWrite,
+					  dst_path, dst_file, buf, off,
+					  page_size) != DB_SUCCESS) {
 				goto error;
 			}
 		}
@@ -5151,7 +5140,7 @@ xb_process_datadir(
 	handle_datadir_entry_func_t	func)	/*!<in: callback */
 {
 	ulint		ret;
-	char		dbpath[OS_FILE_MAX_PATH+1];
+	char		dbpath[OS_FILE_MAX_PATH+2];
 	os_file_dir_t	dir;
 	os_file_dir_t	dbdir;
 	os_file_stat_t	dbinfo;
@@ -5246,6 +5235,7 @@ next_file_item_1:
 						    fileinfo.name, NULL))
 					{
 						os_file_closedir(dbdir);
+						os_file_closedir(dir);
 						return(FALSE);
 					}
 				}
@@ -5481,7 +5471,7 @@ static bool xtrabackup_prepare_func(char** argv)
 		sync_check_init();
 		ut_d(sync_check_enable());
 		ut_crc32_init();
-		recv_sys_init();
+		recv_sys.create();
 		log_sys.create();
 		recv_recovery_on = true;
 
@@ -5773,7 +5763,18 @@ static bool check_all_privileges()
 			PRIVILEGE_WARNING);
 	}
 
-	return !(check_result & PRIVILEGE_ERROR);
+	if (check_result & PRIVILEGE_ERROR) {
+		msg("Current privileges, as reported by 'SHOW GRANTS': ");
+		int n=1;
+		for (std::list<std::string>::const_iterator it = granted_privileges.begin();
+			it != granted_privileges.end();
+			it++,n++) {
+				msg("  %d.%s", n, it->c_str());
+		}
+		return false;
+	}
+
+	return true;
 }
 
 bool

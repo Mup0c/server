@@ -15,7 +15,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1335  USA */
 
 
 #ifdef USE_PRAGMA_INTERFACE
@@ -525,7 +525,7 @@ class Rewritable_query_parameter
     Value of 0 means that this object doesn't have to be replaced
     (for example SP variables in control statements)
   */
-  uint pos_in_query;
+  my_ptrdiff_t pos_in_query;
 
   /*
     Byte length of parameter name in the statement.  This is not
@@ -713,6 +713,8 @@ public:
 
 
 /****************************************************************************/
+
+#define STOP_PTR ((void *) 1)
 
 class Item: public Value_source,
             public Type_all_attributes
@@ -946,7 +948,7 @@ public:
   void set_name(THD *thd, const char *str, size_t length, CHARSET_INFO *cs);
   void set_name_no_truncate(THD *thd, const char *str, uint length,
                             CHARSET_INFO *cs);
-  void init_make_send_field(Send_field *tmp_field,enum enum_field_types type);
+  void init_make_send_field(Send_field *tmp_field, const Type_handler *h);
   virtual void cleanup();
   virtual void make_send_field(THD *thd, Send_field *field);
 
@@ -1245,6 +1247,15 @@ public:
   }
   longlong val_int_unsigned_typecast_from_int();
   longlong val_int_unsigned_typecast_from_str();
+  longlong val_int_unsigned_typecast_from_real();
+
+  /**
+    Get a value for CAST(x AS UNSIGNED).
+    Huge positive unsigned values are converted to negative complements.
+  */
+  longlong val_int_signed_typecast_from_int();
+  longlong val_int_signed_typecast_from_real();
+
   /*
     This is just a shortcut to avoid the cast. You should still use
     unsigned_flag to check the sign of the item.
@@ -1448,6 +1459,13 @@ public:
     return type_handler()->Item_val_bool(this);
   }
   virtual String *val_raw(String*) { return 0; }
+
+  bool eval_const_cond()
+  {
+    DBUG_ASSERT(const_item());
+    DBUG_ASSERT(!is_expensive());
+    return val_bool();
+  }
 
   /*
     save_val() is method of val_* family which stores value in the given
@@ -1822,8 +1840,10 @@ public:
   /*========= Item processors, to be used with Item::walk() ========*/
   virtual bool remove_dependence_processor(void *arg) { return 0; }
   virtual bool cleanup_processor(void *arg);
-  virtual bool cleanup_excluding_fields_processor(void *arg) { return cleanup_processor(arg); }
-  virtual bool cleanup_excluding_const_fields_processor(void *arg) { return cleanup_processor(arg); }
+  virtual bool cleanup_excluding_fields_processor (void *arg)
+  { return cleanup_processor(arg); }
+  virtual bool cleanup_excluding_const_fields_processor (void *arg)
+  { return cleanup_processor(arg); }
   virtual bool collect_item_field_processor(void *arg) { return 0; }
   virtual bool collect_outer_ref_processor(void *arg) {return 0; }
   virtual bool check_inner_refs_processor(void *arg) { return 0; }
@@ -1863,9 +1883,11 @@ public:
     Not to be used for AND/OR formulas.
   */
   virtual bool excl_dep_on_table(table_map tab_map) { return false; }
-  /* 
+  /*
     TRUE if the expression depends only on grouping fields of sel
-    or can be converted to such an exression using equalities.
+    or can be converted to such an expression using equalities.
+    It also checks if the expression doesn't contain stored procedures,
+    subqueries or randomly generated elements.
     Not to be used for AND/OR formulas.
   */
   virtual bool excl_dep_on_grouping_fields(st_select_lex *sel)
@@ -1876,15 +1898,6 @@ public:
     Not to be used for AND/OR formulas.
   */
   virtual bool excl_dep_on_in_subq_left_part(Item_in_subselect *subq_pred)
-  { return false; }
-  /*
-    TRUE if the expression depends only on grouping fields of sel
-    or can be converted to such an expression using equalities.
-    It also checks if the expression doesn't contain stored procedures,
-    subqueries or randomly generated elements.
-    Not to be used for AND/OR formulas.
-  */
-  virtual bool excl_dep_on_group_fields_for_having_pushdown(st_select_lex *sel)
   { return false; }
 
   virtual bool switch_to_nullable_fields_processor(void *arg) { return 0; }
@@ -1943,6 +1956,12 @@ public:
   virtual bool check_partition_func_processor(void *arg) { return 1;}
   virtual bool post_fix_fields_part_expr_processor(void *arg) { return 0; }
   virtual bool rename_fields_processor(void *arg) { return 0; }
+  /*
+    TRUE if the function is knowingly TRUE or FALSE.
+    Not to be used for AND/OR formulas.
+  */
+  virtual bool is_simplified_cond_processor(void *arg) { return false; }
+
   /** Processor used to check acceptability of an item in the defining
       expression for a virtual column 
 
@@ -2081,6 +2100,10 @@ public:
   virtual Item *in_subq_field_transformer_for_having(THD *thd, uchar *arg)
   { return this; }
   virtual Item *in_predicate_to_in_subs_transformer(THD *thd, uchar *arg)
+  { return this; }
+  virtual Item *field_transformer_for_having_pushdown(THD *thd, uchar *arg)
+  { return this; }
+  virtual Item *multiple_equality_transformer(THD *thd, uchar *arg)
   { return this; }
   virtual bool expr_cache_is_needed(THD *) { return FALSE; }
   virtual Item *safe_charset_converter(THD *thd, CHARSET_INFO *tocs);
@@ -2262,6 +2285,11 @@ public:
   */
   virtual void under_not(Item_func_not * upper
                          __attribute__((unused))) {};
+  /*
+    If Item_field is wrapped in Item_direct_wrep remove this Item_direct_ref
+    wrapper.
+  */
+  virtual Item *remove_item_direct_ref() { return this; }
 	
 
   void register_in(THD *thd);	 
@@ -2302,24 +2330,6 @@ public:
     Checks if this item consists in the left part of arg IN subquery predicate
   */
   bool pushable_equality_checker_for_subquery(uchar *arg);
-  /*
-    Checks if this item is of the type FIELD_ITEM or REF_ITEM so it
-    can be pushed as the part of the equality into the WHERE clause.
-  */
-  bool pushable_equality_checker_for_having_pushdown(uchar *arg);
-  /*
-    Checks if this item consists in the GROUP BY of the SELECT arg
-  */
-  bool dep_on_grouping_fields_checker(uchar *arg)
-  { return excl_dep_on_grouping_fields((st_select_lex *) arg); }
-  /*
-    Checks if this item consists in the GROUP BY of the SELECT arg
-    with respect to the pushdown from HAVING into WHERE clause limitations.
-  */
-  bool dep_on_grouping_fields_checker_for_having_pushdown(uchar *arg)
-  {
-    return excl_dep_on_group_fields_for_having_pushdown((st_select_lex *) arg);
-  }
 };
 
 MEM_ROOT *get_thd_memroot(THD *thd);
@@ -2497,17 +2507,7 @@ protected:
     }
     return true;
   }
-  bool excl_dep_on_grouping_fields(st_select_lex *sel)
-  {
-    for (uint i= 0; i < arg_count; i++)
-    {
-      if (args[i]->const_item())
-        continue;
-      if (!args[i]->excl_dep_on_grouping_fields(sel))
-        return false;
-    }
-    return true;
-  }
+  bool excl_dep_on_grouping_fields(st_select_lex *sel);
   bool eq(const Item_args *other, bool binary_cmp) const
   {
     for (uint i= 0; i < arg_count ; i++)
@@ -2528,7 +2528,6 @@ protected:
     }
     return true;
   }
-  bool excl_dep_on_group_fields_for_having_pushdown(st_select_lex *sel);
 public:
   Item_args(void)
     :args(NULL), arg_count(0)
@@ -3443,8 +3442,6 @@ public:
   bool excl_dep_on_table(table_map tab_map);
   bool excl_dep_on_grouping_fields(st_select_lex *sel);
   bool excl_dep_on_in_subq_left_part(Item_in_subselect *subq_pred);
-  bool excl_dep_on_group_fields_for_having_pushdown(st_select_lex *sel)
-  { return excl_dep_on_grouping_fields(sel); }
   bool cleanup_excluding_fields_processor(void *arg)
   { return field ? 0 : cleanup_processor(arg); }
   bool cleanup_excluding_const_fields_processor(void *arg)
@@ -5335,8 +5332,6 @@ public:
   { return (*ref)->excl_dep_on_grouping_fields(sel); }
   bool excl_dep_on_in_subq_left_part(Item_in_subselect *subq_pred)
   { return (*ref)->excl_dep_on_in_subq_left_part(subq_pred); }
-  bool excl_dep_on_group_fields_for_having_pushdown(st_select_lex *sel)
-  { return (*ref)->excl_dep_on_group_fields_for_having_pushdown(sel); }
   bool cleanup_excluding_fields_processor(void *arg)
   {
     Item *item= real_item();
@@ -5355,6 +5350,13 @@ public:
   }
   bool with_sum_func() const { return m_with_sum_func; }
   With_sum_func_cache* get_with_sum_func_cache() { return this; }
+  Item *field_transformer_for_having_pushdown(THD *thd, uchar *arg)
+  { return (*ref)->field_transformer_for_having_pushdown(thd, arg); }
+  Item *remove_item_direct_ref()
+  {
+    *ref= (*ref)->remove_item_direct_ref();
+    return this;
+  }
 };
 
 
@@ -5399,6 +5401,8 @@ public:
   virtual Ref_Type ref_type() { return DIRECT_REF; }
   Item *get_copy(THD *thd)
   { return get_item_copy<Item_direct_ref>(thd, this); }
+  Item *remove_item_direct_ref()
+  { return (*ref)->remove_item_direct_ref(); }
 };
 
 
@@ -5651,7 +5655,6 @@ public:
   bool excl_dep_on_table(table_map tab_map);
   bool excl_dep_on_grouping_fields(st_select_lex *sel);
   bool excl_dep_on_in_subq_left_part(Item_in_subselect *subq_pred);
-  bool excl_dep_on_group_fields_for_having_pushdown(st_select_lex *sel);
   Item *derived_field_transformer_for_having(THD *thd, uchar *arg);
   Item *derived_field_transformer_for_where(THD *thd, uchar *arg);
   Item *grouping_field_transformer_for_where(THD *thd, uchar *arg);
@@ -5747,6 +5750,9 @@ public:
   }
   Item *get_copy(THD *thd)
   { return get_item_copy<Item_direct_view_ref>(thd, this); }
+  Item *field_transformer_for_having_pushdown(THD *thd, uchar *arg)
+  { return this; }
+  Item *remove_item_direct_ref() { return this; }
 };
 
 
@@ -6548,6 +6554,8 @@ public:
   virtual void set_null();
   bool walk(Item_processor processor, bool walk_subquery, void *arg)
   {
+    if (arg == STOP_PTR)
+      return FALSE;
     if (example && example->walk(processor, walk_subquery, arg))
       return TRUE;
     return (this->*processor)(arg);
@@ -6759,8 +6767,7 @@ public:
   }
   longlong val_datetime_packed(THD *thd)
   {
-    DBUG_ASSERT(0);
-    return 0;
+    return to_datetime(current_thd).to_packed();
   }
   longlong val_time_packed(THD *thd)
   {
@@ -6775,21 +6782,44 @@ public:
 
 class Item_cache_real: public Item_cache
 {
+protected:
   double value;
 public:
-  Item_cache_real(THD *thd): Item_cache(thd, &type_handler_double),
-    value(0) {}
-
+  Item_cache_real(THD *thd, const Type_handler *h)
+   :Item_cache(thd, h),
+    value(0)
+  {}
   double val_real();
   longlong val_int();
-  String* val_str(String *str);
   my_decimal *val_decimal(my_decimal *);
   bool get_date(THD *thd, MYSQL_TIME *ltime, date_mode_t fuzzydate)
   { return get_date_from_real(thd, ltime, fuzzydate); }
   bool cache_value();
   Item *convert_to_basic_const_item(THD *thd);
+};
+
+
+class Item_cache_double: public Item_cache_real
+{
+public:
+  Item_cache_double(THD *thd)
+   :Item_cache_real(thd, &type_handler_double)
+  { }
+  String* val_str(String *str);
   Item *get_copy(THD *thd)
-  { return get_item_copy<Item_cache_real>(thd, this); }
+  { return get_item_copy<Item_cache_double>(thd, this); }
+};
+
+
+class Item_cache_float: public Item_cache_real
+{
+public:
+  Item_cache_float(THD *thd)
+   :Item_cache_real(thd, &type_handler_float)
+  { }
+  String* val_str(String *str);
+  Item *get_copy(THD *thd)
+  { return get_item_copy<Item_cache_float>(thd, this); }
 };
 
 
@@ -7132,7 +7162,7 @@ bool fix_escape_item(THD *thd, Item *escape_item, String *tmp_str,
 
 inline bool Virtual_column_info::is_equal(const Virtual_column_info* vcol) const
 {
-  return field_type == vcol->get_real_type()
+  return type_handler()  == vcol->type_handler()
       && stored_in_db == vcol->is_stored()
       && expr->eq(vcol->expr, true);
 }

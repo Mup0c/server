@@ -13,7 +13,7 @@ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
-51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -491,8 +491,6 @@ row_ins_cascade_calc_update_vec(
 	doc_id_t	new_doc_id = FTS_NULL_DOC_ID;
 	ulint		prefix_col;
 
-	ut_a(node);
-	ut_a(foreign);
 	ut_a(cascade);
 	ut_a(table);
 	ut_a(index);
@@ -1089,10 +1087,6 @@ row_ins_foreign_check_on_constraint(
 	doc_id_t	doc_id = FTS_NULL_DOC_ID;
 
 	DBUG_ENTER("row_ins_foreign_check_on_constraint");
-	ut_a(thr);
-	ut_a(foreign);
-	ut_a(pcur);
-	ut_a(mtr);
 
 	trx = thr_get_trx(thr);
 
@@ -1549,7 +1543,7 @@ row_ins_set_exclusive_rec_lock(
 /***************************************************************//**
 Checks if foreign key constraint fails for an index entry. Sets shared locks
 which lock either the success or the failure of the constraint. NOTE that
-the caller must have a shared latch on dict_operation_lock.
+the caller must have a shared latch on dict_sys.latch.
 @return DB_SUCCESS, DB_NO_REFERENCED_ROW, or DB_ROW_IS_REFERENCED */
 dberr_t
 row_ins_check_foreign_constraint(
@@ -1590,7 +1584,7 @@ row_ins_check_foreign_constraint(
 	upd_node= NULL;
 #endif /* WITH_WSREP */
 
-	ut_ad(rw_lock_own(dict_operation_lock, RW_LOCK_S));
+	ut_ad(rw_lock_own(&dict_sys.latch, RW_LOCK_S));
 
 	err = DB_SUCCESS;
 
@@ -1996,7 +1990,7 @@ row_ins_check_foreign_constraints(
 			}
 
 			/* NOTE that if the thread ends up waiting for a lock
-			we will release dict_operation_lock temporarily!
+			we will release dict_sys.latch temporarily!
 			But the counter on the table protects the referenced
 			table from being dropped while the check is running. */
 
@@ -2788,8 +2782,7 @@ do_insert:
 
 			DBUG_EXECUTE_IF(
 				"row_ins_extern_checkpoint",
-				log_make_checkpoint_at(
-					LSN_MAX, TRUE););
+				log_write_up_to(mtr.commit_lsn(), true););
 			err = row_ins_index_entry_big_rec(
 				entry, big_rec, offsets, &offsets_heap, index,
 				thr_get_trx(thr)->mysql_thd);
@@ -2998,7 +2991,7 @@ row_ins_sec_index_entry_low(
 				"Table %s is encrypted but encryption service or"
 				" used key_id is not available. "
 				" Can't continue reading table.",
-				index->table->name);
+				index->table->name.m_name);
 			index->table->file_unreadable = true;
 		}
 		goto func_exit;
@@ -3046,9 +3039,9 @@ row_ins_sec_index_entry_low(
 			if (!index->is_committed()) {
 				ut_ad(!thr_get_trx(thr)
 				      ->dict_operation_lock_mode);
-				mutex_enter(&dict_sys->mutex);
+				mutex_enter(&dict_sys.mutex);
 				dict_set_corrupted_index_cache_only(index);
-				mutex_exit(&dict_sys->mutex);
+				mutex_exit(&dict_sys.mutex);
 				/* Do not return any error to the
 				caller. The duplicate will be reported
 				by ALTER TABLE or CREATE UNIQUE INDEX.
@@ -3419,14 +3412,14 @@ row_ins_spatial_index_entry_set_mbr_field(
 	dfield_t*	field,		/*!< in/out: mbr field */
 	const dfield_t*	row_field)	/*!< in: row field */
 {
-	uchar*		dptr = NULL;
 	ulint		dlen = 0;
 	double		mbr[SPDIMS * 2];
 
 	/* This must be a GEOMETRY datatype */
 	ut_ad(DATA_GEOMETRY_MTYPE(field->type.mtype));
 
-	dptr = static_cast<uchar*>(dfield_get_data(row_field));
+	const byte* dptr = static_cast<const byte*>(
+		dfield_get_data(row_field));
 	dlen = dfield_get_len(row_field);
 
 	/* obtain the MBR */

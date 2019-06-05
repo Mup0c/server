@@ -12,7 +12,7 @@
 # 
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1335 USA
 
 IF(WIN32)
   SET(localstatedir "C:\\\\mysql\\\\data\\\\")
@@ -148,9 +148,11 @@ IF(UNIX)
   IF (INSTALL_SYSCONFDIR)
     INSTALL(FILES ${CMAKE_CURRENT_BINARY_DIR}/mysql-log-rotate DESTINATION ${INSTALL_SYSCONFDIR}/logrotate.d
             RENAME mysql COMPONENT SupportFiles)
-    INSTALL(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/mysql.server
-            DESTINATION  ${INSTALL_SYSCONFDIR}/init.d
-            RENAME mysql COMPONENT SupportFiles)
+    IF(NOT HAVE_SYSTEMD)
+      INSTALL(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/mysql.server
+              DESTINATION  ${INSTALL_SYSCONFDIR}/init.d
+              RENAME mysql COMPONENT SupportFiles)
+    ENDIF()
 
     INSTALL(FILES rpm/my.cnf DESTINATION ${INSTALL_SYSCONFDIR}
             COMPONENT Common)

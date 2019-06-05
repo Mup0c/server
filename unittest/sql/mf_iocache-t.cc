@@ -11,7 +11,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02111-1301 USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA */
 
 #include <my_global.h>
 #include <my_sys.h>
@@ -358,7 +358,7 @@ void mdev17133()
       // random size 2nd read
       res= my_b_read(&info, buf_i + total + MY_MIN(19, curr_read_size),
                      19 >= curr_read_size ? 0 : curr_read_size - 19);
-      ok(res == 0, "rest of read %lu", (ulong) (curr_read_size - 19));
+      ok(res == 0, "rest of read %zu", curr_read_size - 19);
       // mark read bytes in the used part of the cache buffer
       memset(info.buffer, 0, info.read_pos - info.buffer);
 

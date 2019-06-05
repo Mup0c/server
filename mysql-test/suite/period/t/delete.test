@@ -1,6 +1,7 @@
 source suite/period/engines.inc;
+source include/have_log_bin.inc;
 
-create or replace table t (id int, s date, e date, period for apptime(s,e));
+create table t (id int, s date, e date, period for apptime(s,e));
 
 insert into t values(1, '1999-01-01', '2018-12-12');
 insert into t values(1, '1999-01-01', '2017-01-01');
@@ -133,7 +134,7 @@ delete from v for portion of p from '2000-01-01' to '2018-01-01';
 
 --echo # View can't be used
 create or replace view v as select t.* from t, t as t1;
---error ER_IT_IS_A_VIEW
+--error ER_VIEW_DELETE_MERGE_VIEW
 delete from v for portion of p from '2000-01-01' to '2018-01-01';
 
 --echo # auto_increment field overflow
@@ -180,4 +181,6 @@ delete from t for portion of apptime from '1999-01-03' to '2018-12-10';
 --sorted_result
 select *, datediff(e, s) from t;
 
-create or replace database test;
+drop table t,t2,t3,log_tbl;
+drop view v;
+drop procedure log;

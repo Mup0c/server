@@ -12,7 +12,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1335  USA */
 
 
 /* Some general useful functions */
@@ -59,6 +59,8 @@ struct extra2_fields
   LEX_CUSTRING field_flags;
   LEX_CUSTRING system_period;
   LEX_CUSTRING application_period;
+  void reset()
+  { bzero((void*)this, sizeof(*this)); }
 };
 
 static Virtual_column_info * unpack_vcol_info_from_frm(THD *, MEM_ROOT *,
@@ -1251,7 +1253,7 @@ bool parse_vcol_defs(THD *thd, MEM_ROOT *mem_root, TABLE *table,
   if (check_constraint_ptr)
     *check_constraint_ptr= 0;
 
-  /* Check that expressions aren't refering to not yet initialized fields */
+  /* Check that expressions aren't referring to not yet initialized fields */
   for (field_ptr= table->field; *field_ptr; field_ptr++)
   {
     Field *field= *field_ptr;
@@ -1451,7 +1453,7 @@ bool read_extra2(const uchar *frm_image, size_t len, extra2_fields *fields)
 
   DBUG_ENTER("read_extra2");
 
-  memset(fields, 0, sizeof(extra2_fields));
+  fields->reset();
 
   if (*extra2 != '/')   // old frm had '/' there
   {
@@ -2087,7 +2089,7 @@ int TABLE_SHARE::init_from_binary_frm_image(THD *thd, bool write,
     DBUG_PRINT("info", ("Columns with system versioning: [%d, %d]",
                         vers.start_fieldno, vers.end_fieldno));
     versioned= VERS_TIMESTAMP;
-    vers_can_native= plugin_hton(se_plugin)->flags & HTON_NATIVE_SYS_VERSIONING;
+    vers_can_native= handler_file->vers_can_native(thd);
     status_var_increment(thd->status_var.feature_system_versioning);
   } // if (system_period == NULL)
 
@@ -2106,6 +2108,7 @@ int TABLE_SHARE::init_from_binary_frm_image(THD *thd, bool write,
 
     if (init_period_from_extra2(&period, pos, end))
       goto err;
+    status_var_increment(thd->status_var.feature_application_time_periods);
   }
 
   for (i=0 ; i < share->fields; i++, strpos+=field_pack_length, field_ptr++)
@@ -2209,7 +2212,8 @@ int TABLE_SHARE::init_from_binary_frm_image(THD *thd, bool write,
           goto err;
         vcol_info= new (&share->mem_root) Virtual_column_info();
         uint vcol_info_length= uint2korr(vcol_screen_pos + 1);
-        DBUG_ASSERT(vcol_info_length);
+        if (!vcol_info_length) // Expect non-empty expression
+          goto err;
         vcol_info->stored_in_db= vcol_screen_pos[3];
         vcol_info->utf8= 0;
         vcol_screen_pos+= vcol_info_length + MYSQL57_GCOL_HEADER_SIZE;;
@@ -2310,7 +2314,6 @@ int TABLE_SHARE::init_from_binary_frm_image(THD *thd, bool write,
         switch (handler->real_field_type())
         {
         case MYSQL_TYPE_TIMESTAMP2:
-        case MYSQL_TYPE_DATETIME2:
           break;
         case MYSQL_TYPE_LONGLONG:
           if (vers_can_native)
@@ -2687,7 +2690,7 @@ int TABLE_SHARE::init_from_binary_frm_image(THD *thd, bool write,
           field->key_start.set_bit(key);
         if (field->key_length() == key_part->length &&
             !(field->flags & BLOB_FLAG) &&
-            key_info->algorithm != HA_KEY_ALG_LONG_HASH)
+            keyinfo->algorithm != HA_KEY_ALG_LONG_HASH)
         {
           if (handler_file->index_flags(key, i, 0) & HA_KEYREAD_ONLY)
           {
@@ -3581,10 +3584,6 @@ enum open_frm_error open_table_from_share(THD *thd, TABLE_SHARE *share,
     goto err;
 
   outparam->alias.set(tmp_alias, alias->length, table_alias_charset);
-  outparam->quick_keys.init();
-  outparam->covering_keys.init();
-  outparam->intersect_keys.init();
-  outparam->keys_in_use_for_query.init();
 
   /* Allocate handler */
   outparam->file= 0;
@@ -6515,7 +6514,8 @@ const char *Field_iterator_table_ref::get_table_name()
     return natural_join_it.column_ref()->safe_table_name();
 
   DBUG_ASSERT(!strcmp(table_ref->table_name.str,
-                      table_ref->table->s->table_name.str));
+                      table_ref->table->s->table_name.str) ||
+              table_ref->schema_table);
   return table_ref->table_name.str;
 }
 
@@ -7635,6 +7635,26 @@ bool TABLE::add_tmp_key(uint key, uint key_parts,
     key_part_info++;
   }
 
+  /*
+    For the case when there is a derived table that would give distinct rows,
+    the index statistics are passed to the join optimizer to tell that a ref
+    access to all the fields of the derived table will produce only one row.
+  */
+
+  st_select_lex_unit* derived= pos_in_table_list ?
+                               pos_in_table_list->derived: NULL;
+  if (derived)
+  {
+    st_select_lex* first= derived->first_select();
+    uint select_list_items= first->get_item_list()->elements;
+    if (key_parts == select_list_items)
+    {
+      if ((!first->is_part_of_union() && (first->options & SELECT_DISTINCT)) ||
+          derived->check_distinct_in_union())
+        keyinfo->rec_per_key[key_parts - 1]= 1;
+    }
+  }
+
   set_if_bigger(s->max_key_length, keyinfo->key_length);
   s->keys++;
   return FALSE;
@@ -8077,10 +8097,10 @@ public:
 
 
 /*
-  to satisfy ASSERT_COLUMN_MARKED_FOR_WRITE Field's assert we temporarily
+  to satisfy marked_for_write_or_computed() Field's assert we temporarily
   mark field for write before storing the generated value in it
 */
-#ifndef DBUG_OFF
+#ifdef DBUG_ASSERT_EXISTS
 #define DBUG_FIX_WRITE_SET(f) bool _write_set_fixed= !bitmap_fast_test_and_set(write_set, (f)->field_index)
 #define DBUG_RESTORE_WRITE_SET(f) if (_write_set_fixed) bitmap_clear_bit(write_set, (f)->field_index)
 #else
@@ -9011,6 +9031,8 @@ void re_setup_keyinfo_hash(KEY *key_info)
 */
 void TABLE::clone_handler_for_update()
 {
+  if (this->update_handler)
+    return;
   handler *update_handler= NULL;
   if (!s->long_unique_table)
     return;
@@ -9149,7 +9171,10 @@ bool TR_table::query(ulonglong trx_id)
     return false;
   select= make_select(table, 0, 0, conds, NULL, 0, &error);
   if (unlikely(error || !select))
+  {
+    my_error(ER_OUT_OF_RESOURCES, MYF(0));
     return false;
+  }
   // FIXME: (performance) force index 'transaction_id'
   error= init_read_record(&info, thd, table, select, NULL,
                           1 /* use_record_cache */, true /* print_error */,
@@ -9159,6 +9184,7 @@ bool TR_table::query(ulonglong trx_id)
     if (select->skip_record(thd) > 0)
       return true;
   }
+  my_error(ER_VERS_NO_TRX_ID, MYF(0), (longlong) trx_id);
   return false;
 }
 
@@ -9402,6 +9428,7 @@ bool vers_select_conds_t::eq(const vers_select_conds_t &conds) const
     return true;
   case SYSTEM_TIME_BEFORE:
     DBUG_ASSERT(0);
+    return false;
   case SYSTEM_TIME_AS_OF:
     return start.eq(conds.start);
   case SYSTEM_TIME_FROM_TO:

@@ -14,7 +14,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335  USA */
 
 /*
   Because of the function make_new_field() all field classes that have static
@@ -464,6 +464,7 @@ inline bool is_temporal_type_with_date(enum_field_types type)
   case MYSQL_TYPE_DATETIME2:
   case MYSQL_TYPE_TIMESTAMP2:
     DBUG_ASSERT(0); // field->real_type() should not get to here.
+    return false;
   default:
     return false;
   }
@@ -523,7 +524,8 @@ static inline const char *vcol_type_name(enum_vcol_info_type type)
   - whether the field is used in a partitioning expression
 */
 
-class Virtual_column_info: public Sql_alloc
+class Virtual_column_info: public Sql_alloc,
+                           private Type_handler_hybrid_field_type
 {
 private:
   enum_vcol_info_type vcol_type; /* Virtual column expression type */
@@ -531,7 +533,6 @@ private:
     The following data is only updated by the parser and read
     when a Create_field object is created/initialized.
   */
-  enum_field_types field_type;   /* Real field type*/
   /* Flag indicating that the field used in a partitioning expression */
   bool in_partitioning_expr;
 
@@ -545,8 +546,8 @@ public:
   uint flags;
 
   Virtual_column_info()
-  : vcol_type((enum_vcol_info_type)VCOL_TYPE_NONE),
-    field_type((enum enum_field_types)MYSQL_TYPE_VIRTUAL),
+   :Type_handler_hybrid_field_type(&type_handler_null),
+    vcol_type((enum_vcol_info_type)VCOL_TYPE_NONE),
     in_partitioning_expr(FALSE), stored_in_db(FALSE),
     utf8(TRUE), expr(NULL), flags(0)
   {
@@ -567,14 +568,11 @@ public:
     DBUG_ASSERT(vcol_type != VCOL_TYPE_NONE);
     return vcol_type_name(vcol_type);
   }
-  enum_field_types get_real_type() const
-  {
-    return field_type;
-  }
-  void set_field_type(enum_field_types fld_type)
+  void set_handler(const Type_handler *handler)
   {
     /* Calling this function can only be done once. */
-    field_type= fld_type;
+    DBUG_ASSERT(type_handler() == &type_handler_null);
+    Type_handler_hybrid_field_type::set_handler(handler);
   }
   bool is_stored() const
   {
@@ -626,6 +624,9 @@ public:
   static void operator delete(void *ptr_arg, size_t size) { TRASH_FREE(ptr_arg, size); }
   static void operator delete(void *ptr, MEM_ROOT *mem_root)
   { DBUG_ASSERT(0); }
+
+  bool marked_for_read() const;
+  bool marked_for_write_or_computed() const;
 
   /**
      Used by System Versioning.
@@ -778,6 +779,11 @@ public:
     @retval false - conversion is needed
   */
   virtual bool memcpy_field_possible(const Field *from) const= 0;
+  virtual bool make_empty_rec_store_default_value(THD *thd, Item *item);
+  virtual void make_empty_rec_reset(THD *thd)
+  {
+    reset();
+  }
   virtual int  store(const char *to, size_t length,CHARSET_INFO *cs)=0;
   virtual int  store_hex_hybrid(const char *str, size_t length);
   virtual int  store(double nr)=0;
@@ -1501,7 +1507,7 @@ public:
     of a table is compatible with the old definition so that it can
     determine if data needs to be copied over (table data change).
   */
-  virtual uint is_equal(Create_field *new_field);
+  virtual uint is_equal(Create_field *new_field)= 0;
   /* convert decimal to longlong with overflow check */
   longlong convert_decimal2longlong(const my_decimal *val, bool unsigned_flag,
                                     int *err);
@@ -1865,7 +1871,6 @@ public:
   my_decimal *val_decimal(my_decimal *);
   bool val_bool() { return val_real() != 0e0; }
   virtual bool str_needs_quotes() { return TRUE; }
-  uint is_equal(Create_field *new_field);
   bool eq_cmp_as_binary() { return MY_TEST(flags & BINARY_FLAG); }
   virtual uint length_size() { return 0; }
   double pos_in_interval(Field *min, Field *max)
@@ -1921,6 +1926,7 @@ protected:
                CHARSET_INFO *cs, size_t nchars);
   String *uncompress(String *val_buffer, String *val_ptr,
                      const uchar *from, uint from_length);
+  bool csinfo_change_allows_instant_alter(const Create_field *to) const;
 public:
   Field_longstr(uchar *ptr_arg, uint32 len_arg, uchar *null_ptr_arg,
                 uchar null_bit_arg, utype unireg_check_arg,
@@ -2637,6 +2643,7 @@ public:
   my_decimal *val_decimal(my_decimal *) { return 0; }
   String *val_str(String *value,String *value2)
   { value2->length(0); return value2;}
+  uint is_equal(Create_field *new_field);
   int cmp(const uchar *a, const uchar *b) { return 0;}
   void sort_string(uchar *buff, uint length)  {}
   uint32 pack_length() const { return 0; }
@@ -3560,6 +3567,7 @@ public:
   int cmp(const uchar *,const uchar *);
   void sort_string(uchar *buff,uint length);
   void sql_type(String &str) const;
+  uint is_equal(Create_field *new_field);
   virtual uchar *pack(uchar *to, const uchar *from,
                       uint max_length);
   virtual const uchar *unpack(uchar* to, const uchar *from,
@@ -3861,6 +3869,7 @@ public:
     uint32 chars= octets / field_charset->mbminlen;
     return Information_schema_character_attributes(octets, chars);
   }
+  void make_send_field(Send_field *);
   Copy_func *get_copy_func(const Field *from) const
   {
     /*
@@ -3889,6 +3898,7 @@ public:
            !compression_method() == !from->compression_method() &&
            !table->copy_blobs;
   }
+  bool make_empty_rec_store_default_value(THD *thd, Item *item);
   int store(const char *to, size_t length, CHARSET_INFO *charset);
   using Field_str::store;
   double val_real(void);
@@ -4115,6 +4125,10 @@ public:
   {
     return Information_schema_character_attributes();
   }
+  void make_send_field(Send_field *to)
+  {
+    Field_longstr::make_send_field(to);
+  }
   bool can_optimize_range(const Item_bool_func *cond,
                                   const Item *item,
                                   bool is_eq_func) const;
@@ -4202,6 +4216,16 @@ public:
     return save_in_field_str(to);
   }
   bool memcpy_field_possible(const Field *from) const { return false; }
+  void make_empty_rec_reset(THD *thd)
+  {
+    if (flags & NOT_NULL_FLAG)
+    {
+      set_notnull();
+      store((longlong) 1, true);
+    }
+    else
+      reset();
+  }
   int  store(const char *to,size_t length,CHARSET_INFO *charset);
   int  store(double nr);
   int  store(longlong nr, bool unsigned_val);
@@ -4268,6 +4292,11 @@ public:
     {
       flags=(flags & ~ENUM_FLAG) | SET_FLAG;
     }
+  void make_empty_rec_reset(THD *thd)
+  {
+    Field::make_empty_rec_reset(thd);
+  }
+
   int  store_field(Field *from) { return from->save_in_field(this); }
   int  store(const char *to,size_t length,CHARSET_INFO *charset);
   int  store(double nr) { return Field_set::store((longlong) nr, FALSE); }
@@ -4823,6 +4852,14 @@ public:
     }
     return 0;
   }
+  static Row_definition_list *make(MEM_ROOT *mem_root, Spvar_definition *var)
+  {
+    Row_definition_list *list;
+    if (!(list= new (mem_root) Row_definition_list()))
+      return NULL;
+    return list->push_back(var, mem_root) ? NULL : list;
+  }
+  bool append_uniq(MEM_ROOT *thd, Spvar_definition *var);
   bool adjust_formal_params_to_actual_params(THD *thd, List<Item> *args);
   bool adjust_formal_params_to_actual_params(THD *thd,
                                              Item **args, uint arg_count);
@@ -4967,7 +5004,7 @@ public:
   /** structure with parsed options (for comparing fields in ALTER TABLE) */
   ha_field_option_struct *option_struct;
   uint	offset;
-  uint8 interval_id;                    // For rea_create_table
+  uint8 interval_id;
   bool create_if_not_exists;            // Used in ALTER TABLE IF NOT EXISTS
 
   Create_field():
@@ -4994,14 +5031,15 @@ public:
   A class for sending info to the client
 */
 
-class Send_field :public Sql_alloc {
- public:
+class Send_field :public Sql_alloc,
+                  public Type_handler_hybrid_field_type
+{
+public:
   const char *db_name;
   const char *table_name,*org_table_name;
   LEX_CSTRING col_name, org_col_name;
   ulong length;
   uint flags, decimals;
-  enum_field_types type;
   Send_field() {}
   Send_field(Field *field)
   {
@@ -5009,11 +5047,12 @@ class Send_field :public Sql_alloc {
     DBUG_ASSERT(table_name != 0);
     normalize();
   }
-
+  Send_field(THD *thd, Item *item);
   Send_field(Field *field,
              const char *db_name_arg,
              const char *table_name_arg)
-   :db_name(db_name_arg),
+   :Type_handler_hybrid_field_type(field->type_handler()),
+    db_name(db_name_arg),
     table_name(table_name_arg),
     org_table_name(table_name_arg),
     col_name(field->field_name),
@@ -5021,33 +5060,25 @@ class Send_field :public Sql_alloc {
     length(field->field_length),
     flags(field->table->maybe_null ?
           (field->flags & ~NOT_NULL_FLAG) : field->flags),
-    decimals(field->decimals()),
-    type(field->type())
+    decimals(field->decimals())
   {
     normalize();
   }
 
-  // This should move to Type_handler eventually
-  static enum_field_types protocol_type_code(enum_field_types type)
-  {
-    /* Keep things compatible for old clients */
-    if (type == MYSQL_TYPE_VARCHAR)
-      return MYSQL_TYPE_VAR_STRING;
-    return type;
-  }
+private:
   void normalize()
   {
     /* limit number of decimals for float and double */
-    if (type == MYSQL_TYPE_FLOAT || type == MYSQL_TYPE_DOUBLE)
+    if (type_handler()->field_type() == MYSQL_TYPE_FLOAT ||
+        type_handler()->field_type() == MYSQL_TYPE_DOUBLE)
       set_if_smaller(decimals, FLOATING_POINT_DECIMALS);
-    /* Keep things compatible for old clients */
-    type= protocol_type_code(type);
   }
-
+public:
   // This should move to Type_handler eventually
   uint32 max_char_length(CHARSET_INFO *cs) const
   {
-    return type >= MYSQL_TYPE_TINY_BLOB && type <= MYSQL_TYPE_BLOB ?
+    return type_handler()->field_type() >= MYSQL_TYPE_TINY_BLOB &&
+           type_handler()->field_type() <= MYSQL_TYPE_BLOB ?
                    length / cs->mbminlen :
                    length / cs->mbmaxlen;
   }
@@ -5077,8 +5108,8 @@ class Send_field :public Sql_alloc {
   bool is_sane() const
   {
     return (decimals <= FLOATING_POINT_DECIMALS ||
-            (type != MYSQL_TYPE_FLOAT && type != MYSQL_TYPE_DOUBLE)) &&
-           type != MYSQL_TYPE_VARCHAR;
+            (type_handler()->field_type() != MYSQL_TYPE_FLOAT &&
+             type_handler()->field_type() != MYSQL_TYPE_DOUBLE));
   }
 };
 

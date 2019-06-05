@@ -13,7 +13,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335  USA
 */
 
 /*
@@ -1036,12 +1036,16 @@ static int check_connection(THD *thd)
       */
       statistic_increment(connection_errors_peer_addr, &LOCK_status);
       my_error(ER_BAD_HOST_ERROR, MYF(0));
+      statistic_increment(aborted_connects_preauth, &LOCK_status);
       return 1;
     }
 
     if (thd_set_peer_addr(thd, &net->vio->remote, ip, peer_port,
                           true, &connect_errors))
+    {
+      statistic_increment(aborted_connects_preauth, &LOCK_status);
       return 1;
+    }
   }
   else /* Hostname given means that the connection was on a socket */
   {
@@ -1069,6 +1073,7 @@ static int check_connection(THD *thd)
     */
     statistic_increment(aborted_connects,&LOCK_status);
     statistic_increment(connection_errors_internal, &LOCK_status);
+    statistic_increment(aborted_connects_preauth, &LOCK_status);
     return 1; /* The error is set by alloc(). */
   }
 

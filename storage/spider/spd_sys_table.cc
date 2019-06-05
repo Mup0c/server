@@ -11,7 +11,7 @@
 
   You should have received a copy of the GNU General Public License
   along with this program; if not, write to the Free Software
-  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA */
 
 #define MYSQL_SERVER 1
 #include <my_global.h>
@@ -2427,6 +2427,7 @@ int spider_get_sys_tables_static_link_id(
 ) {
   int error_num = 0;
   DBUG_ENTER("spider_get_sys_tables_static_link_id");
+  *static_link_id = NULL;
   if (
     !table->field[24]->is_null() &&
     (*static_link_id = get_field(mem_root, table->field[24]))
